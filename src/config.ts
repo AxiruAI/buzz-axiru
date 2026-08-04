@@ -1,0 +1,501 @@
+/**
+ * Configuration loading for buzz-axiru.
+ *
+ * Policies load from a local policies.json (path resolution order:
+ * explicit argument, BUZZ_AXIRU_POLICIES env var, ./policies.json).
+ * The file describes a small set of named controls; each control maps
+ * onto a preset from @axiru/agent-spend-guardrails. Policy documents
+ * are built per request so the per-agent daily cap can be pinned to
+ * the requesting agent's Nostr pubkey.
+ *
+ * Licensed under the Apache License, Version 2.0.
+ */
+
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
+import {
+  businessHoursOnly,
+  counterpartyAllowlist,
+  humanApprovalAboveAmount,
+  perAgentDailyCap,
+  velocityCountCap,
+  type PolicyV2,
+  type Rail
+} from "@axiru/agent-spend-guardrails";
+
+export interface BridgeControls {
+  per_agent_daily_cap?: { cap_minor_units: string };
+  single_payment_ceiling?: {
+    threshold_minor_units: string;
+    approver_group?: string;
+  };
+  counterparty_allowlist?: { allowed_ids: string[] };
+  business_hours?: {
+    tz: string;
+    open_hour?: number;
+    close_hour?: number;
+    effect?: "deny" | "require_approval";
+  };
+  velocity_count_cap?: {
+    window?: "24h" | "30d";
+    max_count: number;
+    effect?: "deny" | "require_approval";
+  };
+}
+
+export interface BuzzChannelConfig {
+  /** Buzz channel UUID to post approval requests into (via buzz CLI). */
+  channel_id: string | null;
+  /** Path to the buzz CLI binary. Defaults to "buzz" on PATH. */
+  cli_path: string;
+}
+
+/** The downstream payment MCP server the gate spawns and fronts. */
+export interface DownstreamConfig {
+  command: string;
+  args: string[];
+  /** Extra environment variables for the child (merged over process.env). */
+  env: Record<string, string>;
+  /** Per-request timeout against the downstream server. Default 30000. */
+  request_timeout_ms: number;
+  /** Downstream tool names to omit from the merged tools/list. */
+  hide_tools: string[];
+}
+
+/**
+ * How to read a payment out of one gated tool's arguments. Field paths
+ * are dot-separated into the tool call's arguments object, e.g.
+ * "amount" or "payment.total_minor_units".
+ */
+export interface ToolMapping {
+  /** Path to the amount. The value must be a non-negative integer (number or string), in minor units. */
+  amount_field?: string;
+  /** Path to the currency string. */
+  currency_field?: string;
+  /** Static currency when the tool has no currency argument. */
+  currency?: string;
+  /** Path to the counterparty id. */
+  counterparty_field?: string;
+  /** Static counterparty id when the tool has no counterparty argument. */
+  counterparty?: string;
+}
+
+export interface PaymentToolsConfig {
+  /**
+   * Tool-name patterns to gate ("create_payment", "refund_*"). "*"
+   * matches any run of characters. Tools that match no pattern pass
+   * through untouched.
+   */
+  gate: string[];
+  /** Per-tool amount mappings. Keys are exact names or the same glob form. */
+  mappings: Record<string, ToolMapping>;
+}
+
+export interface BridgeConfig {
+  /**
+   * Rail label passed to the policy evaluator. The evaluator ships
+   * reference evaluators for "x402", "stripe", "stripe_daa" and
+   * "usdc_solana"; any other value fails closed to deny. The bridge
+   * itself never touches a rail; this only selects which reference
+   * evaluator reasons about the intent.
+   */
+  rail: Rail;
+  /** Currency the policy pack is denominated in ("USD", "USDC", ...). */
+  currency: string;
+  controls: BridgeControls;
+  buzz: BuzzChannelConfig;
+  /** Optional webhook POSTed on approval requests and outcomes. */
+  webhook_url: string | null;
+  /** Directory for the decision ledger and pending approvals. */
+  data_dir: string;
+  /** Absolute path the config was loaded from (for logs). */
+  config_path: string;
+  /** Downstream payment MCP server for gate mode; null = advisory only. */
+  downstream: DownstreamConfig | null;
+  /**
+   * Which downstream tools are payment-class. null means the operator
+   * configured a downstream but no matcher; the gate FAILS CLOSED and
+   * gates every downstream tool.
+   */
+  payment_tools: PaymentToolsConfig | null;
+  /**
+   * Seconds a parked approval stays decidable. After this it expires:
+   * it can no longer be granted and is never executed. null disables
+   * expiry (not recommended). Default 86400 (24 hours).
+   */
+  approval_ttl_seconds: number | null;
+  /**
+   * The Nostr pubkey decisions are attributed to in gate mode, where
+   * downstream tool calls carry no agent_pubkey argument. Overridden
+   * by BUZZ_AXIRU_AGENT_PUBKEY. If neither is set the gate still fails
+   * closed: decisions are attributed to the all-zeros pubkey, so every
+   * unattributed agent shares one daily cap.
+   */
+  agent_pubkey: string | null;
+}
+
+export const DEFAULT_POLICIES_FILE = "policies.json";
+
+/** Load and validate policies.json. Throws with a clear message on bad input. */
+export function loadConfig(policiesPath?: string, dataDirOverride?: string): BridgeConfig {
+  const path = resolve(
+    policiesPath ?? process.env.BUZZ_AXIRU_POLICIES ?? DEFAULT_POLICIES_FILE
+  );
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(path, "utf8"));
+  } catch (err) {
+    throw new Error(
+      `buzz-axiru: cannot read policies file at ${path}: ${(err as Error).message}`
+    );
+  }
+  if (typeof raw !== "object" || raw === null) {
+    throw new Error(`buzz-axiru: policies file ${path} must be a JSON object`);
+  }
+  const doc = raw as Record<string, unknown>;
+
+  const rail = typeof doc.rail === "string" && doc.rail.length > 0 ? doc.rail : "x402";
+  const currency =
+    typeof doc.currency === "string" && doc.currency.length > 0
+      ? doc.currency.toUpperCase()
+      : "USD";
+  const controls = (doc.controls ?? {}) as BridgeControls;
+
+  const buzzRaw = (doc.buzz ?? {}) as Record<string, unknown>;
+  const buzz: BuzzChannelConfig = {
+    channel_id: typeof buzzRaw.channel_id === "string" ? buzzRaw.channel_id : null,
+    cli_path: typeof buzzRaw.cli_path === "string" ? buzzRaw.cli_path : "buzz"
+  };
+
+  const data_dir = resolve(
+    dataDirOverride ??
+      process.env.BUZZ_AXIRU_DATA_DIR ??
+      (typeof doc.data_dir === "string" ? doc.data_dir : "data")
+  );
+
+  const config: BridgeConfig = {
+    rail: rail as Rail,
+    currency,
+    controls,
+    buzz,
+    webhook_url: typeof doc.webhook_url === "string" ? doc.webhook_url : null,
+    data_dir,
+    config_path: path,
+    downstream: parseDownstream(doc.downstream, path),
+    payment_tools: parsePaymentTools(doc.payment_tools, path),
+    approval_ttl_seconds: parseTtl(doc.approval_ttl_seconds, path),
+    agent_pubkey: parseAgentPubkey(doc.agent_pubkey, path)
+  };
+
+  // Fail fast: building policies validates every control's shape.
+  policiesForAgent(config, "0".repeat(64));
+  return config;
+}
+
+function parseDownstream(raw: unknown, path: string): DownstreamConfig | null {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== "object") {
+    throw new Error(`buzz-axiru: ${path}: "downstream" must be an object or null`);
+  }
+  const d = raw as Record<string, unknown>;
+  if (typeof d.command !== "string" || d.command.length === 0) {
+    throw new Error(`buzz-axiru: ${path}: downstream.command must be a non-empty string`);
+  }
+  const args = d.args === undefined ? [] : d.args;
+  if (!Array.isArray(args) || !args.every((a) => typeof a === "string")) {
+    throw new Error(`buzz-axiru: ${path}: downstream.args must be an array of strings`);
+  }
+  const env: Record<string, string> = {};
+  if (d.env !== undefined && d.env !== null) {
+    if (typeof d.env !== "object") {
+      throw new Error(`buzz-axiru: ${path}: downstream.env must be an object of strings`);
+    }
+    for (const [key, value] of Object.entries(d.env as Record<string, unknown>)) {
+      if (key.startsWith("$")) continue;
+      if (typeof value !== "string") {
+        throw new Error(`buzz-axiru: ${path}: downstream.env.${key} must be a string`);
+      }
+      env[key] = value;
+    }
+  }
+  const timeout =
+    d.request_timeout_ms === undefined ? 30_000 : Number(d.request_timeout_ms);
+  if (!Number.isFinite(timeout) || timeout <= 0) {
+    throw new Error(`buzz-axiru: ${path}: downstream.request_timeout_ms must be a positive number`);
+  }
+  const hide = d.hide_tools === undefined ? [] : d.hide_tools;
+  if (!Array.isArray(hide) || !hide.every((h) => typeof h === "string")) {
+    throw new Error(`buzz-axiru: ${path}: downstream.hide_tools must be an array of strings`);
+  }
+  return {
+    command: d.command,
+    args: args as string[],
+    env,
+    request_timeout_ms: timeout,
+    hide_tools: hide as string[]
+  };
+}
+
+function parsePaymentTools(raw: unknown, path: string): PaymentToolsConfig | null {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== "object") {
+    throw new Error(`buzz-axiru: ${path}: "payment_tools" must be an object or absent`);
+  }
+  const p = raw as Record<string, unknown>;
+  const gate = p.gate === undefined ? [] : p.gate;
+  if (!Array.isArray(gate) || !gate.every((g) => typeof g === "string")) {
+    throw new Error(`buzz-axiru: ${path}: payment_tools.gate must be an array of tool-name patterns`);
+  }
+  const mappings: Record<string, ToolMapping> = {};
+  if (p.mappings !== undefined && p.mappings !== null) {
+    if (typeof p.mappings !== "object") {
+      throw new Error(`buzz-axiru: ${path}: payment_tools.mappings must be an object`);
+    }
+    for (const [key, value] of Object.entries(p.mappings as Record<string, unknown>)) {
+      if (key.startsWith("$")) continue;
+      if (typeof value !== "object" || value === null) {
+        throw new Error(`buzz-axiru: ${path}: payment_tools.mappings["${key}"] must be an object`);
+      }
+      const m = value as Record<string, unknown>;
+      const mapping: ToolMapping = {};
+      for (const field of [
+        "amount_field",
+        "currency_field",
+        "currency",
+        "counterparty_field",
+        "counterparty"
+      ] as const) {
+        const v = m[field];
+        if (v !== undefined) {
+          if (typeof v !== "string" || v.length === 0) {
+            throw new Error(
+              `buzz-axiru: ${path}: payment_tools.mappings["${key}"].${field} must be a non-empty string`
+            );
+          }
+          mapping[field] = v;
+        }
+      }
+      mappings[key] = mapping;
+    }
+  }
+  return { gate: gate as string[], mappings };
+}
+
+function parseTtl(raw: unknown, path: string): number | null {
+  if (raw === undefined) return 86_400;
+  if (raw === null) return null;
+  const ttl = Number(raw);
+  if (!Number.isFinite(ttl) || ttl <= 0) {
+    throw new Error(`buzz-axiru: ${path}: approval_ttl_seconds must be a positive number or null`);
+  }
+  return ttl;
+}
+
+function parseAgentPubkey(raw: unknown, path: string): string | null {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== "string" || !isPlausiblePubkey(raw)) {
+    throw new Error(
+      `buzz-axiru: ${path}: agent_pubkey must be a Nostr pubkey (64-char lowercase hex or npub form)`
+    );
+  }
+  return raw;
+}
+
+/* ------------------------------------------------------------------ */
+/* Tool-name matching and payment extraction (gate mode)              */
+/* ------------------------------------------------------------------ */
+
+/** Glob match where "*" is the only wildcard (matches any run, including empty). */
+export function matchesPattern(pattern: string, name: string): boolean {
+  const escaped = pattern
+    .split("*")
+    .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join(".*");
+  return new RegExp(`^${escaped}$`).test(name);
+}
+
+/**
+ * Whether a downstream tool is gated. FAIL CLOSED: when a downstream
+ * is configured without payment_tools, every tool is gated.
+ */
+export function isGatedTool(config: BridgeConfig, toolName: string): boolean {
+  if (config.downstream === null) return false;
+  if (config.payment_tools === null) return true;
+  return config.payment_tools.gate.some((pattern) => matchesPattern(pattern, toolName));
+}
+
+/** Find the amount mapping for a tool: exact key first, then glob keys. */
+export function mappingForTool(config: BridgeConfig, toolName: string): ToolMapping | null {
+  const mappings = config.payment_tools?.mappings ?? {};
+  if (Object.prototype.hasOwnProperty.call(mappings, toolName)) return mappings[toolName]!;
+  for (const [key, mapping] of Object.entries(mappings)) {
+    if (key.includes("*") && matchesPattern(key, toolName)) return mapping;
+  }
+  return null;
+}
+
+/** Dot-separated path lookup into a JSON arguments object. */
+export function getPath(obj: unknown, path: string): unknown {
+  let current: unknown = obj;
+  for (const segment of path.split(".")) {
+    if (typeof current !== "object" || current === null) return undefined;
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return current;
+}
+
+export type ExtractionResult =
+  | { ok: true; amount_minor_units: string; currency: string; counterparty: string }
+  | { ok: false; reason_code: string; detail: string };
+
+const INTEGER_STRING = /^[0-9]+$/;
+
+/**
+ * Read amount, currency, and counterparty out of a gated tool call's
+ * arguments. Every unreadable case FAILS CLOSED: the caller must route
+ * the call to require_approval, never allow.
+ */
+export function extractPayment(
+  config: BridgeConfig,
+  toolName: string,
+  args: Record<string, unknown>
+): ExtractionResult {
+  const mapping = mappingForTool(config, toolName);
+  if (mapping === null || mapping.amount_field === undefined) {
+    return {
+      ok: false,
+      reason_code: "bridge.pending.no_payment_mapping",
+      detail:
+        `no amount mapping configured for gated tool "${toolName}"; ` +
+        "add payment_tools.mappings entry with amount_field to enable policy evaluation"
+    };
+  }
+
+  const rawAmount = getPath(args, mapping.amount_field);
+  let amount: string | null = null;
+  if (typeof rawAmount === "number" && Number.isSafeInteger(rawAmount) && rawAmount >= 0) {
+    amount = String(rawAmount);
+  } else if (typeof rawAmount === "string" && INTEGER_STRING.test(rawAmount)) {
+    amount = rawAmount;
+  }
+  if (amount === null) {
+    return {
+      ok: false,
+      reason_code: "bridge.pending.amount_unextractable",
+      detail:
+        `could not read a non-negative integer amount from "${mapping.amount_field}" ` +
+        `in the arguments of "${toolName}"`
+    };
+  }
+
+  let currency: string;
+  if (mapping.currency_field !== undefined) {
+    const rawCurrency = getPath(args, mapping.currency_field);
+    if (typeof rawCurrency !== "string" || rawCurrency.trim().length === 0) {
+      return {
+        ok: false,
+        reason_code: "bridge.pending.currency_unextractable",
+        detail: `could not read a currency from "${mapping.currency_field}" in the arguments of "${toolName}"`
+      };
+    }
+    currency = rawCurrency.toUpperCase();
+  } else {
+    currency = (mapping.currency ?? config.currency).toUpperCase();
+  }
+
+  let counterparty: string;
+  if (mapping.counterparty_field !== undefined) {
+    const rawCounterparty = getPath(args, mapping.counterparty_field);
+    if (typeof rawCounterparty !== "string" || rawCounterparty.trim().length === 0) {
+      return {
+        ok: false,
+        reason_code: "bridge.pending.counterparty_unextractable",
+        detail: `could not read a counterparty from "${mapping.counterparty_field}" in the arguments of "${toolName}"`
+      };
+    }
+    counterparty = rawCounterparty;
+  } else {
+    counterparty = mapping.counterparty ?? `tool:${toolName}`;
+  }
+
+  return { ok: true, amount_minor_units: amount, currency, counterparty };
+}
+
+/**
+ * Build the policy set for one requesting agent. The per-agent daily
+ * cap is instantiated with the agent's pubkey as the initiator id, so
+ * caps are enforced per identity, exactly how Buzz scopes agents.
+ */
+export function policiesForAgent(config: BridgeConfig, agentPubkey: string): PolicyV2[] {
+  const c = config.controls;
+  const policies: PolicyV2[] = [];
+
+  if (c.per_agent_daily_cap) {
+    policies.push(
+      perAgentDailyCap({
+        agent_id: agentPubkey,
+        currency: config.currency,
+        cap_minor_units: c.per_agent_daily_cap.cap_minor_units
+      })
+    );
+  }
+  if (c.single_payment_ceiling) {
+    policies.push(
+      humanApprovalAboveAmount({
+        currency: config.currency,
+        threshold_minor_units: c.single_payment_ceiling.threshold_minor_units,
+        ...(c.single_payment_ceiling.approver_group !== undefined
+          ? { approver_group: c.single_payment_ceiling.approver_group }
+          : {})
+      })
+    );
+  }
+  if (c.counterparty_allowlist) {
+    policies.push(
+      counterpartyAllowlist({ allowed_ids: c.counterparty_allowlist.allowed_ids })
+    );
+  }
+  if (c.business_hours) {
+    policies.push(
+      businessHoursOnly({
+        tz: c.business_hours.tz,
+        ...(c.business_hours.open_hour !== undefined
+          ? { open_hour: c.business_hours.open_hour }
+          : {}),
+        ...(c.business_hours.close_hour !== undefined
+          ? { close_hour: c.business_hours.close_hour }
+          : {}),
+        ...(c.business_hours.effect !== undefined ? { effect: c.business_hours.effect } : {})
+      })
+    );
+  }
+  if (c.velocity_count_cap) {
+    policies.push(
+      velocityCountCap({
+        max_count: c.velocity_count_cap.max_count,
+        ...(c.velocity_count_cap.window !== undefined
+          ? { window: c.velocity_count_cap.window }
+          : {}),
+        ...(c.velocity_count_cap.effect !== undefined
+          ? { effect: c.velocity_count_cap.effect }
+          : {})
+      })
+    );
+  }
+  return policies;
+}
+
+/**
+ * VERIFIED (block/buzz docs): buzz-acp allowlists identify authors as
+ * "64-char hex pubkeys", and agent keys are minted as nsec/npub Nostr
+ * keypairs. The bridge accepts either form but treats the string as an
+ * opaque identity: policies and ledger records key on the exact string.
+ * Use the hex form everywhere for consistency.
+ */
+export const HEX_PUBKEY = /^[0-9a-f]{64}$/;
+export const NPUB = /^npub1[02-9ac-hj-np-z]{6,}$/;
+
+export function isPlausiblePubkey(value: string): boolean {
+  return HEX_PUBKEY.test(value) || NPUB.test(value);
+}

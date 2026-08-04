@@ -1,0 +1,7 @@
+node_modules/
+dist/
+vendor/agent-spend-guardrails/dist/
+data/
+demo/.demo-data/
+*.log
+.DS_Store

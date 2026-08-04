@@ -1,0 +1,58 @@
+{
+  "name": "buzz-axiru",
+  "version": "0.2.0",
+  "description": "Bounded spend authority for Buzz agents. A gating MCP proxy in front of your payment MCP server: policy evaluation before money moves, human approvals in the Buzz channel, and a hash-chained decision log keyed to the agent's Nostr pubkey.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AxiruAI/buzz-axiru.git"
+  },
+  "homepage": "https://github.com/AxiruAI/buzz-axiru#readme",
+  "bugs": {
+    "url": "https://github.com/AxiruAI/buzz-axiru/issues"
+  },
+  "keywords": [
+    "buzz",
+    "nostr",
+    "ai-agents",
+    "mcp",
+    "agent-payments",
+    "spend-controls",
+    "guardrails",
+    "approvals"
+  ],
+  "bin": {
+    "buzz-axiru": "dist/src/cli.js"
+  },
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    }
+  },
+  "files": [
+    "dist/src",
+    "policies.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p vendor/agent-spend-guardrails/tsconfig.json && tsc -p tsconfig.json",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "demo": "npm run build && node dist/demo/demo.js",
+    "verify": "node dist/src/cli.js verify"
+  },
+  "dependencies": {
+    "@axiru/agent-spend-guardrails": "file:vendor/agent-spend-guardrails"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.6.3"
+  }
+}
