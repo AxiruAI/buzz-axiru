@@ -1,8 +1,8 @@
 /**
- * Gate mode: a gating MCP proxy in front of a downstream payment MCP
- * server. The agent talks to the gate; the gate spawns the downstream
- * server as a child process, re-exposes its tools, and intercepts
- * every call to a payment-class tool:
+ * Gate mode: a gating MCP proxy in front of one or more downstream MCP
+ * servers. The agent talks to the gate; the gate spawns each downstream
+ * server as a child process, re-exposes their tools under one merged
+ * namespace, and intercepts every call to a payment-class tool:
  *
  *   allow            -> the call is executed against the downstream
  *                       server and its result returned unchanged
@@ -34,7 +34,8 @@ import { sha256Fingerprint } from "@axiru/agent-spend-guardrails";
 
 import { isExpired, type ApprovalRequest } from "./approvals.js";
 import { extractPayment, isGatedTool, type BridgeConfig } from "./config.js";
-import { DownstreamClient, DownstreamError, type DownstreamTool } from "./downstream.js";
+import { DownstreamError, type DownstreamTool } from "./downstream.js";
+import { DownstreamPool } from "./pool.js";
 import type { Bridge, SpendRequest } from "./guard.js";
 import {
   errorResponse,
@@ -76,7 +77,12 @@ function textResult(payload: Record<string, unknown>, isError: boolean): ToolCal
 }
 
 export class GateServer {
-  readonly downstream: DownstreamClient;
+  /**
+   * The downstream side, one or many servers behind a single facade.
+   * Named "downstream" still: from the gate's point of view there is
+   * one thing to start, close, and call tools on.
+   */
+  readonly downstream: DownstreamPool;
   private downstreamTools: DownstreamTool[] = [];
   private readonly clock: () => Date;
   private readonly quiet: boolean;
@@ -100,12 +106,7 @@ export class GateServer {
     this.gateAll = config.payment_tools === null;
     this.agentPubkey =
       process.env.BUZZ_AXIRU_AGENT_PUBKEY ?? config.agent_pubkey ?? UNATTRIBUTED_PUBKEY;
-    this.downstream = new DownstreamClient({
-      command: config.downstream.command,
-      args: config.downstream.args,
-      env: config.downstream.env,
-      request_timeout_ms: config.downstream.request_timeout_ms
-    });
+    this.downstream = new DownstreamPool(config.downstream);
   }
 
   private get config(): BridgeConfig {
@@ -120,16 +121,25 @@ export class GateServer {
       const gated = this.downstreamTools
         .map((t) => t.name)
         .filter((name) => this.isGated(name));
+      const perServer = this.downstream.servers
+        .map((server) => {
+          const count = this.downstreamTools.filter(
+            (t) => this.downstream.serverFor(t.name) === server.name
+          ).length;
+          return `${server.name} (${count} tools)`;
+        })
+        .join(", ");
       process.stderr.write(
-        `buzz-axiru gate: downstream ${this.config.downstream!.command} up | ` +
-          `${this.downstreamTools.length} tools | gated: ${gated.join(", ") || "(none)"}\n`
+        `buzz-axiru gate: downstream up: ${perServer} | ` +
+          `${this.downstreamTools.length} tools total | gated: ${gated.join(", ") || "(none)"}\n`
       );
       if (this.gateAll) {
         process.stderr.write(
           "buzz-axiru gate: WARNING: no payment_tools matcher in the config file. " +
-            "Failing closed: EVERY downstream tool is gated and, with no amount " +
-            "mappings, every call will require human approval. Add payment_tools " +
-            "to gate only the tools that move money.\n"
+            "Failing closed: EVERY tool from EVERY configured downstream server is " +
+            "gated, shell tools included, and with no amount mappings every call " +
+            "will require human approval. Add payment_tools to gate only the tools " +
+            "that move money.\n"
         );
       }
       if (this.agentPubkey === UNATTRIBUTED_PUBKEY) {
@@ -146,6 +156,11 @@ export class GateServer {
     this.downstream.close();
   }
 
+  /**
+   * toolName is the EXPOSED name: payment_tools.gate patterns and
+   * payment_tools.mappings keys match the name the agent sees, which
+   * already includes the owning server's tool_prefix.
+   */
   isGated(toolName: string): boolean {
     if (toolName === TOOL_NAME) return false;
     return isGatedTool(this.config, toolName);
@@ -221,10 +236,10 @@ export class GateServer {
   }
 
   private mergedTools(): Array<Record<string, unknown>> {
-    const hide = new Set(this.config.downstream!.hide_tools);
+    // The pool already applied hide_tools and tool_prefix, so these are
+    // the exposed names and nothing else needs filtering here.
     const tools: Array<Record<string, unknown>> = [TOOL_DEFINITION as unknown as Record<string, unknown>];
     for (const tool of this.downstreamTools) {
-      if (hide.has(tool.name)) continue;
       if (tool.name === TOOL_NAME) continue; // ours wins
       if (this.isGated(tool.name)) {
         tools.push({ ...tool, description: `${tool.description ?? ""}${GATED_TOOL_NOTICE}` });
@@ -264,9 +279,9 @@ export class GateServer {
       }
     }
 
-    const known = this.downstreamTools.some((t) => t.name === name);
-    const hidden = this.config.downstream!.hide_tools.includes(name);
-    if (!known || hidden) {
+    // Hidden tools never entered the pool's catalog, so "unknown" covers
+    // both never-existed and deliberately hidden.
+    if (!this.downstream.hasTool(name)) {
       return errorResponse(id, -32602, `Unknown tool: ${name}`);
     }
 

@@ -43,9 +43,42 @@ Goose / Codex / Claude Code  (harnessed by buzz-acp)
         `-- data/ledger.jsonl                 hash-chained decision log
 ```
 
-## Two-minute quickstart (gate mode)
+## Quickstart
 
-Node 18 or newer. One config file, one command.
+Node 18 or newer. One command from install to a governed agent:
+
+```bash
+npm install -g buzz-axiru
+buzz-axiru quickstart
+```
+
+`quickstart` finds your Buzz shell server (`BUZZ_ACP_MCP_COMMAND` first, then
+PATH, then the macOS app bundle), writes a working `policies.json` in the
+current directory, and prints the wiring steps for your harness. It never
+prompts: every choice has a flag (`--harness buzz|goose|claude-code|codex`,
+`--force` to overwrite an existing `policies.json`, `--yes` to accept all
+defaults). For Buzz the printed steps boil down to:
+
+```bash
+export BUZZ_ACP_MCP_COMMAND=buzz-axiru
+# restart the agent in Buzz, then prove the gate is up:
+buzz-axiru quickstart --check
+```
+
+`--check` loads the config, starts every configured downstream server exactly
+the way `serve` does, prints each server with its tool count and which tools
+are gated, and exits 0 on success, 1 on failure.
+
+The generated config exposes your shell server's tools unchanged and gates
+`pay_*` only. To put a payment server behind the same gate, move the
+ready-made `$downstream_payment_slot` object in `policies.json` into the
+`downstream` array and restart. Details on the multi-server fan-out are in
+[How gating works](#how-gating-works).
+
+### Manual setup
+
+Prefer to wire it by hand, or gating a payment server on a harness quickstart
+does not know? Same result, three steps.
 
 ```bash
 npm install -g buzz-axiru     # or run from a clone: npm install && npm run build
@@ -135,6 +168,33 @@ patterns (`*` is a wildcard). Tools that match are intercepted; everything
 else passes through untouched, including tool listing, resources, prompts,
 and any other request the downstream server understands.
 `downstream.hide_tools` removes tools from the merged listing entirely.
+
+**Several servers behind one slot.** Buzz gives an agent exactly one MCP
+server, so an agent normally gets a shell server or a payment server, never
+both. Because the gate is a proxy, `downstream` also accepts an ARRAY of
+server blocks: the gate takes that single slot and fans out behind it. Each
+entry may set `name` (defaults to the command basename, must be unique) and
+`tool_prefix`, which renames that server's tools on the way out. Gate patterns
+and amount mappings match the EXPOSED name, prefix included. Two servers
+exposing the same tool name is a startup error, never a silent winner, and if
+any server fails to start the gate refuses to run at all. With multiple
+servers the no-`payment_tools` fail-closed rule gates shell tools too, which
+is why the array example prefixes the payment server with `pay_` and gates
+`pay_*`.
+
+```jsonc
+"downstream": [
+  { "name": "buzz-dev", "command": "buzz-dev-mcp" },
+  {
+    "name": "payments",
+    "command": "npx",
+    "args": ["-y", "@stripe/mcp", "--tools=all"],
+    "env": { "STRIPE_SECRET_KEY": "sk_test_..." },
+    "tool_prefix": "pay_"
+  }
+],
+"payment_tools": { "gate": ["pay_*"], "mappings": { "pay_create_payment": { "amount_field": "amount" } } }
+```
 
 **Fail closed, everywhere it matters:**
 
@@ -305,8 +365,9 @@ Read this section before trusting the gate with anything.
   (unless you omit the matcher entirely, in which case everything is gated).
   Review the downstream server's tool list when you configure it, and again
   when you upgrade it.
-- This is a local, single-process gate in front of one downstream server per
-  instance: one bridge, one data directory, files on disk. It is not the
+- This is a local, single-process gate: one bridge, one data directory, files
+  on disk. It can front several downstream servers at once, but they all share
+  that single process and ledger. It is not the
   hosted product's multi-rail enforcement, queue, or replication. The serve
   process and the approve/deny CLI may interleave ledger writes; truly
   concurrent writers are not supported.

@@ -5,13 +5,16 @@
  *   buzz-axiru                       start the MCP server on stdio (default)
  *   buzz-axiru serve                 same, explicit; --mode gate|advisory
  *   buzz-axiru init                  write a starter policies.json here
+ *   buzz-axiru quickstart            detect your setup, write policies.json,
+ *                                    print wiring steps; --check verifies it
  *   buzz-axiru pending               list approvals waiting on a human
  *   buzz-axiru approve <id>          grant a pending approval
  *   buzz-axiru deny <id>             deny a pending approval
  *   buzz-axiru verify                re-derive the ledger hash chain
  *
  * Flags: --mode gate|advisory  --policies <path>  --data-dir <path>
- *        --by <name>  --note <text>  --force (init)
+ *        --by <name>  --note <text>  --force (init, quickstart)
+ *        --harness buzz|goose|claude-code|codex  --yes  --check (quickstart)
  * Env:   BUZZ_AXIRU_POLICIES, BUZZ_AXIRU_DATA_DIR, BUZZ_AXIRU_AGENT_PUBKEY
  *
  * Licensed under the Apache License, Version 2.0.
@@ -21,12 +24,20 @@ import { existsSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 import { isExpired } from "./approvals.js";
-import { loadConfig } from "./config.js";
+import { isGatedTool, loadConfig } from "./config.js";
 import { GateServer } from "./gate.js";
 import { Bridge } from "./guard.js";
 import { verifyLedger } from "./ledger.js";
-import { McpServer } from "./mcp.js";
+import { LATEST_PROTOCOL_VERSION, McpServer } from "./mcp.js";
 import { notifyApprovalDecided } from "./notify.js";
+import { DownstreamPool } from "./pool.js";
+import {
+  buildQuickstartPolicies,
+  detectBuzzDevMcp,
+  harnessNextSteps,
+  writeQuickstartPolicies,
+  HARNESSES
+} from "./quickstart.js";
 import { STARTER_POLICIES } from "./scaffold.js";
 
 const VERSION = "0.2.0";
@@ -96,6 +107,120 @@ function runInit(flags: Record<string, string>): void {
   );
 }
 
+/**
+ * `buzz-axiru quickstart`: the one-command install. Detects the shell
+ * MCP server, writes a working policies.json, and prints the wiring
+ * steps for the chosen harness. Non-interactive: every choice has a
+ * flag, and --yes exists so scripts can state "defaults accepted"
+ * explicitly (there are no prompts to answer).
+ */
+function runQuickstart(flags: Record<string, string>): void {
+  const harness = flags.harness ?? "buzz";
+  if (!(HARNESSES as readonly string[]).includes(harness)) {
+    fail(
+      `buzz-axiru quickstart: unknown --harness "${harness}" (use ${HARNESSES.join(", ")})`
+    );
+  }
+  const detected = detectBuzzDevMcp();
+  // The shell entry is Buzz's bundled server. Other harnesses bring
+  // their own tools, so their config starts in advisory mode with the
+  // payment slot ready to move into the downstream array.
+  const shell = harness === "buzz" ? detected : null;
+  const path = resolve(flags.path ?? "policies.json");
+  try {
+    writeQuickstartPolicies(path, buildQuickstartPolicies(shell), flags.force === "true");
+  } catch (err) {
+    fail(`buzz-axiru quickstart: ${(err as Error).message}`);
+  }
+  const lines: string[] = [`buzz-axiru ${VERSION} quickstart`, ""];
+  lines.push(`harness: ${harness}`);
+  if (harness === "buzz") {
+    lines.push(
+      detected !== null
+        ? `shell server: ${detected.command} (found via ${detected.source})`
+        : "shell server: buzz-dev-mcp NOT FOUND (checked BUZZ_ACP_MCP_COMMAND, PATH,\n" +
+            "              and /Applications/Buzz.app). Wrote an advisory-mode config;\n" +
+            "              nothing is enforced until you add a downstream server."
+    );
+  }
+  lines.push("", `Wrote ${path}`);
+  if (shell !== null) {
+    lines.push(
+      `  downstream:    shell (${shell.command}), tools exposed with their plain names`,
+      '  payment slot:  disabled; move "$downstream_payment_slot" into the',
+      '                 "downstream" array to gate your payment MCP server',
+      "  gated tools:   pay_* (money tools only; shell tools pass through)"
+    );
+  } else {
+    lines.push(
+      "  downstream:    null (advisory mode; nothing enforced yet)",
+      '  payment slot:  "$downstream_payment_slot" is a ready-made entry; set',
+      '                 "downstream" to an array containing it to turn on the gate',
+      "  gated tools:   pay_* once a downstream server is configured"
+    );
+  }
+  lines.push(
+    "  controls:      USD 100,000.00 per-agent daily cap, USD 25,000.00",
+    "                 single-payment ceiling routes to a human, counterparty",
+    "                 allowlist, business hours 09:00-17:00 America/New_York",
+    "",
+    harnessNextSteps(harness),
+    ""
+  );
+  process.stdout.write(lines.join("\n"));
+}
+
+/**
+ * `buzz-axiru quickstart --check`: the "did it work" command. Loads the
+ * config and starts the same DownstreamPool that `serve` runs in gate
+ * mode, so a green check means serve will come up too. Exit 0 on
+ * success, 1 on any failure.
+ */
+async function runQuickstartCheck(flags: Record<string, string>): Promise<void> {
+  const config = loadConfig(flags.policies, flags["data-dir"]);
+  process.stdout.write(`buzz-axiru ${VERSION} check\npolicies: ${config.config_path}\n\n`);
+  if (config.downstream === null) {
+    process.stdout.write(
+      "downstream: null (advisory mode; no servers to start)\n" +
+        "Config loads. Add a downstream server to run the enforcing gate.\n"
+    );
+    return;
+  }
+  const pool = new DownstreamPool(config.downstream);
+  try {
+    await pool.start(LATEST_PROTOCOL_VERSION, VERSION);
+    const tools = await pool.listTools();
+    const width = Math.max(...config.downstream.map((s) => s.name.length));
+    for (const server of config.downstream) {
+      const count = tools.filter((t) => pool.serverFor(t.name) === server.name).length;
+      const prefixNote = server.tool_prefix !== "" ? `, tool prefix "${server.tool_prefix}"` : "";
+      process.stdout.write(
+        `  ${server.name.padEnd(width)}  up  ${String(count).padStart(3)} tools  ` +
+          `(${server.command}${prefixNote})\n`
+      );
+    }
+    const gated = tools.map((t) => t.name).filter((name) => isGatedTool(config, name));
+    process.stdout.write(
+      `\n${tools.length} tools exposed, ${gated.length} gated` +
+        (gated.length > 0 ? `: ${gated.join(", ")}` : "") +
+        "\n"
+    );
+    if (config.payment_tools === null) {
+      process.stdout.write(
+        "NOTE: no payment_tools matcher in the config file. Failing closed:\n" +
+          "every tool from every server is gated. Add payment_tools to gate\n" +
+          "only the tools that move money.\n"
+      );
+    }
+    process.stdout.write("OK: every downstream server started and answered tools/list.\n");
+  } catch (err) {
+    process.stdout.write(`FAILED: ${(err as Error).message}\n`);
+    process.exitCode = 1;
+  } finally {
+    pool.close();
+  }
+}
+
 async function main(): Promise<void> {
   const { command, positional, flags } = parseArgs(process.argv.slice(2));
 
@@ -113,13 +238,18 @@ async function main(): Promise<void> {
         "                               (gate mode when a downstream server is configured,",
         "                               advisory mode otherwise; override with --mode)",
         "  buzz-axiru init              write a starter policies.json in the current directory",
+        "  buzz-axiru quickstart        detect your setup, write policies.json, print wiring",
+        "                               steps (--harness buzz|goose|claude-code|codex, --yes,",
+        "                               --force); --check starts the configured downstream",
+        "                               servers, reports tool counts, and exits 0/1",
         "  buzz-axiru pending           list approvals waiting on a human",
         "  buzz-axiru approve <id>      grant a pending approval",
         "  buzz-axiru deny <id>         deny a pending approval",
         "  buzz-axiru verify            re-derive the decision ledger hash chain",
         "",
         "Flags: --mode gate|advisory  --policies <path>  --data-dir <path>",
-        "       --by <name>  --note <text>  --force (init)",
+        "       --by <name>  --note <text>  --force (init, quickstart)",
+        "       --harness buzz|goose|claude-code|codex  --yes  --check (quickstart)",
         ""
       ].join("\n")
     );
@@ -128,6 +258,15 @@ async function main(): Promise<void> {
 
   if (command === "init") {
     runInit(flags);
+    return;
+  }
+
+  if (command === "quickstart") {
+    if (flags.check === "true") {
+      await runQuickstartCheck(flags);
+    } else {
+      runQuickstart(flags);
+    }
     return;
   }
 

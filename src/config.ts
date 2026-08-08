@@ -12,7 +12,7 @@
  */
 
 import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
 
 import {
   businessHoursOnly,
@@ -51,16 +51,41 @@ export interface BuzzChannelConfig {
   cli_path: string;
 }
 
-/** The downstream payment MCP server the gate spawns and fronts. */
+/**
+ * One downstream MCP server the gate spawns and fronts.
+ *
+ * Buzz gives an agent exactly one MCP server, so an agent that needs
+ * both a shell server and a payment server has nowhere to put the
+ * second one. The gate is a proxy, so it can take that single slot and
+ * fan out to several servers behind it. Config accepts a single object
+ * (the original shape) or an array of these; loadConfig normalizes to
+ * an array so the rest of the code has one case to handle.
+ */
 export interface DownstreamConfig {
+  /**
+   * Label used in error messages, logs, and instruction text. Defaults
+   * to the basename of command. Must be unique across entries: it is
+   * how an operator tells two servers apart when one of them dies.
+   */
+  name: string;
   command: string;
   args: string[];
   /** Extra environment variables for the child (merged over process.env). */
   env: Record<string, string>;
   /** Per-request timeout against the downstream server. Default 30000. */
   request_timeout_ms: number;
-  /** Downstream tool names to omit from the merged tools/list. */
+  /**
+   * Downstream tool names to omit from the merged tools/list. Matched
+   * against the name the server itself reports, before tool_prefix.
+   */
   hide_tools: string[];
+  /**
+   * Prefix every tool from this server with this string when exposing
+   * it to the agent. Empty string means expose names unchanged. This is
+   * the operator's escape hatch for name collisions between servers,
+   * and it also makes payment_tools.gate patterns like "pay_*" possible.
+   */
+  tool_prefix: string;
 }
 
 /**
@@ -111,8 +136,12 @@ export interface BridgeConfig {
   data_dir: string;
   /** Absolute path the config was loaded from (for logs). */
   config_path: string;
-  /** Downstream payment MCP server for gate mode; null = advisory only. */
-  downstream: DownstreamConfig | null;
+  /**
+   * Downstream MCP servers for gate mode; null = advisory only. Always
+   * an array once loaded, even when the config file used the single
+   * object form.
+   */
+  downstream: DownstreamConfig[] | null;
   /**
    * Which downstream tools are payment-class. null means the operator
    * configured a downstream but no matcher; the gate FAILS CLOSED and
@@ -193,28 +222,67 @@ export function loadConfig(policiesPath?: string, dataDirOverride?: string): Bri
   return config;
 }
 
-function parseDownstream(raw: unknown, path: string): DownstreamConfig | null {
+const TOOL_PREFIX_RE = /^[A-Za-z0-9_.-]*$/;
+
+/**
+ * Accepts the historical single object, an array of objects, or null.
+ * Always returns an array (or null), so callers never branch on shape.
+ */
+function parseDownstream(raw: unknown, path: string): DownstreamConfig[] | null {
   if (raw === undefined || raw === null) return null;
+  if (Array.isArray(raw)) {
+    if (raw.length === 0) {
+      throw new Error(
+        `buzz-axiru: ${path}: "downstream" must not be an empty array; use null for advisory mode`
+      );
+    }
+    const entries = raw.map((entry, index) =>
+      parseDownstreamEntry(entry, path, `downstream[${index}]`)
+    );
+    // Names are the only handle an operator has on a specific server in
+    // logs and errors, so ambiguity here is worth failing the load over.
+    const seen = new Map<string, string>();
+    entries.forEach((entry, index) => {
+      const previous = seen.get(entry.name);
+      if (previous !== undefined) {
+        throw new Error(
+          `buzz-axiru: ${path}: duplicate downstream name "${entry.name}" ` +
+            `(${previous} and downstream[${index}]); give each entry a unique "name"`
+        );
+      }
+      seen.set(entry.name, `downstream[${index}]`);
+    });
+    return entries;
+  }
   if (typeof raw !== "object") {
-    throw new Error(`buzz-axiru: ${path}: "downstream" must be an object or null`);
+    throw new Error(
+      `buzz-axiru: ${path}: "downstream" must be an object, an array of objects, or null`
+    );
+  }
+  return [parseDownstreamEntry(raw, path, "downstream")];
+}
+
+function parseDownstreamEntry(raw: unknown, path: string, label: string): DownstreamConfig {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error(`buzz-axiru: ${path}: "${label}" must be an object`);
   }
   const d = raw as Record<string, unknown>;
   if (typeof d.command !== "string" || d.command.length === 0) {
-    throw new Error(`buzz-axiru: ${path}: downstream.command must be a non-empty string`);
+    throw new Error(`buzz-axiru: ${path}: ${label}.command must be a non-empty string`);
   }
   const args = d.args === undefined ? [] : d.args;
   if (!Array.isArray(args) || !args.every((a) => typeof a === "string")) {
-    throw new Error(`buzz-axiru: ${path}: downstream.args must be an array of strings`);
+    throw new Error(`buzz-axiru: ${path}: ${label}.args must be an array of strings`);
   }
   const env: Record<string, string> = {};
   if (d.env !== undefined && d.env !== null) {
     if (typeof d.env !== "object") {
-      throw new Error(`buzz-axiru: ${path}: downstream.env must be an object of strings`);
+      throw new Error(`buzz-axiru: ${path}: ${label}.env must be an object of strings`);
     }
     for (const [key, value] of Object.entries(d.env as Record<string, unknown>)) {
       if (key.startsWith("$")) continue;
       if (typeof value !== "string") {
-        throw new Error(`buzz-axiru: ${path}: downstream.env.${key} must be a string`);
+        throw new Error(`buzz-axiru: ${path}: ${label}.env.${key} must be a string`);
       }
       env[key] = value;
     }
@@ -222,18 +290,35 @@ function parseDownstream(raw: unknown, path: string): DownstreamConfig | null {
   const timeout =
     d.request_timeout_ms === undefined ? 30_000 : Number(d.request_timeout_ms);
   if (!Number.isFinite(timeout) || timeout <= 0) {
-    throw new Error(`buzz-axiru: ${path}: downstream.request_timeout_ms must be a positive number`);
+    throw new Error(`buzz-axiru: ${path}: ${label}.request_timeout_ms must be a positive number`);
   }
   const hide = d.hide_tools === undefined ? [] : d.hide_tools;
   if (!Array.isArray(hide) || !hide.every((h) => typeof h === "string")) {
-    throw new Error(`buzz-axiru: ${path}: downstream.hide_tools must be an array of strings`);
+    throw new Error(`buzz-axiru: ${path}: ${label}.hide_tools must be an array of strings`);
+  }
+  let name: string;
+  if (d.name === undefined) {
+    name = basename(d.command);
+  } else if (typeof d.name !== "string" || d.name.length === 0) {
+    throw new Error(`buzz-axiru: ${path}: ${label}.name must be a non-empty string`);
+  } else {
+    name = d.name;
+  }
+  const tool_prefix = d.tool_prefix === undefined ? "" : d.tool_prefix;
+  if (typeof tool_prefix !== "string" || !TOOL_PREFIX_RE.test(tool_prefix)) {
+    throw new Error(
+      `buzz-axiru: ${path}: ${label}.tool_prefix must be a string matching ` +
+        "[A-Za-z0-9_.-]* (letters, digits, underscore, dot, hyphen)"
+    );
   }
   return {
+    name,
     command: d.command,
     args: args as string[],
     env,
     request_timeout_ms: timeout,
-    hide_tools: hide as string[]
+    hide_tools: hide as string[],
+    tool_prefix
   };
 }
 
@@ -317,7 +402,12 @@ export function matchesPattern(pattern: string, name: string): boolean {
 
 /**
  * Whether a downstream tool is gated. FAIL CLOSED: when a downstream
- * is configured without payment_tools, every tool is gated.
+ * is configured without payment_tools, every tool is gated, across
+ * every configured server.
+ *
+ * toolName is the EXPOSED name, the one the agent sees, so it already
+ * carries the owning server's tool_prefix. Gate patterns and amount
+ * mappings are therefore written against prefixed names ("pay_*").
  */
 export function isGatedTool(config: BridgeConfig, toolName: string): boolean {
   if (config.downstream === null) return false;

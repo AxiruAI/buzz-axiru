@@ -33,26 +33,39 @@
   },
 
   "downstream": null,
-  "$downstream_example": {
-    "$comment": "Set downstream to an object like this to turn on gate mode: the bridge spawns your payment MCP server as a child process, re-exposes its tools, and intercepts every payment-class call. Example for a Stripe MCP server:",
-    "command": "npx",
-    "args": ["-y", "@stripe/mcp", "--tools=all"],
-    "env": { "STRIPE_SECRET_KEY": "sk_test_..." },
-    "request_timeout_ms": 30000,
-    "hide_tools": []
-  },
+  "$downstream_example": [
+    {
+      "$comment": "Set downstream to an object like this, or to an array of them, to turn on gate mode: the bridge spawns each server as a child process, re-exposes their tools under one merged namespace, and intercepts every payment-class call. An array is how you get around Buzz handing an agent exactly one MCP server: the gate takes that slot and fans out. Each entry may set name (defaults to the command basename, must be unique) and tool_prefix (exposed names become <tool_prefix><tool>, which is also what payment_tools patterns match). Colliding exposed names are a startup error, so give one of the servers a prefix.",
+      "name": "buzz-dev",
+      "command": "buzz-dev-mcp",
+      "args": [],
+      "env": {},
+      "request_timeout_ms": 30000,
+      "hide_tools": []
+    },
+    {
+      "$comment": "The payment server, prefixed so shell tools keep their plain names and the gate patterns can target money tools only.",
+      "name": "payments",
+      "command": "npx",
+      "args": ["-y", "@stripe/mcp", "--tools=all"],
+      "env": { "STRIPE_SECRET_KEY": "sk_test_..." },
+      "tool_prefix": "pay_",
+      "request_timeout_ms": 30000,
+      "hide_tools": []
+    }
+  ],
 
   "payment_tools": null,
   "$payment_tools_example": {
-    "$comment": "Which downstream tools are payment-class, and how to read the amount out of their arguments. Patterns support * as a wildcard. FAIL CLOSED: if downstream is set and payment_tools is null, EVERY downstream tool is gated. Field paths are dot-separated into the tool call arguments; amounts must be non-negative integers in minor units.",
-    "gate": ["create_payment", "refund_*"],
+    "$comment": "Which exposed tools are payment-class, and how to read the amount out of their arguments. Patterns match the EXPOSED name, so they include any tool_prefix. Patterns support * as a wildcard. FAIL CLOSED: if downstream is set and payment_tools is null, EVERY tool from EVERY configured server is gated, shell tools included. Gating pay_* only, as below, keeps the shell usable while every money tool stays behind policy. Field paths are dot-separated into the tool call arguments; amounts must be non-negative integers in minor units.",
+    "gate": ["pay_*"],
     "mappings": {
-      "create_payment": {
+      "pay_create_payment": {
         "amount_field": "amount",
         "currency_field": "currency",
         "counterparty_field": "customer"
       },
-      "refund_*": {
+      "pay_refund_*": {
         "amount_field": "amount",
         "currency": "USD"
       }

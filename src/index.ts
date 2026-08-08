@@ -26,6 +26,7 @@ export {
 } from "./config.js";
 export { GateServer, type GateOptions } from "./gate.js";
 export { DownstreamClient, DownstreamError, type DownstreamTool } from "./downstream.js";
+export { DownstreamPool } from "./pool.js";
 export {
   Ledger,
   verifyLedger,
