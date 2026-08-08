@@ -1,6 +1,6 @@
 {
   "name": "buzz-axiru",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Bounded spend authority for Buzz agents. A gating MCP proxy in front of your payment MCP server: policy evaluation before money moves, human approvals in the Buzz channel, and a hash-chained decision log keyed to the agent's Nostr pubkey.",
   "license": "Apache-2.0",
   "type": "module",
@@ -34,6 +34,8 @@
     }
   },
   "files": [
+    "vendor/agent-spend-guardrails/dist",
+    "vendor/agent-spend-guardrails/package.json",
     "dist/src",
     "policies.json",
     "README.md",
