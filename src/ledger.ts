@@ -16,8 +16,13 @@
  *
  * This mirrors the shape of Buzz's own buzz-audit hash-chain log, so
  * an operator reads both the workspace audit trail and the spend
- * trail the same way. It is a local, single-writer file: good for one
- * bridge process, honest about being nothing more.
+ * trail the same way.
+ *
+ * Appends are serialized across processes by the data directory lock
+ * (src/lock.ts). Without it, the serve process and the approve/deny
+ * CLI race between reading the chain tail and writing the next record,
+ * which produces duplicate seq numbers and half-written lines that
+ * make the chain permanently unverifiable.
  *
  * Licensed under the Apache License, Version 2.0.
  */
@@ -27,6 +32,8 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 import { canonicalJsonStringify } from "@axiru/agent-spend-guardrails";
+
+import { withDataDirLock } from "./lock.js";
 
 export const GENESIS_HASH = "0".repeat(64);
 
@@ -95,8 +102,9 @@ function parseLines(filePath: string): string[] {
  * Append-only writer. The chain tail is re-read from the file before
  * every append: in gate mode the serve process and the approve/deny
  * CLI interleave appends from separate processes, and each must chain
- * onto whatever the other wrote last. (Truly simultaneous writers are
- * still out of scope: one bridge, one data directory.)
+ * onto whatever the other wrote last. Re-read and append happen inside
+ * the data directory lock, so no other process can append between
+ * them.
  */
 export class Ledger {
   private lastSeq = 0;
@@ -120,19 +128,24 @@ export class Ledger {
   }
 
   append(entry: LedgerEntryInput): LedgerRecord {
-    this.syncTail();
-    const { ts, ...rest } = entry;
-    const unhashed: Omit<LedgerRecord, "hash"> = {
-      ...rest,
-      seq: this.lastSeq + 1,
-      ts: ts ?? new Date().toISOString(),
-      prev_hash: this.lastHash
-    };
-    const record: LedgerRecord = { ...unhashed, hash: hashRecord(unhashed) };
-    appendFileSync(this.filePath, JSON.stringify(record) + "\n", "utf8");
-    this.lastSeq = record.seq;
-    this.lastHash = record.hash;
-    return record;
+    // Read-tail and append are one critical section: a second writer
+    // slipping between them would chain onto the same prev_hash and
+    // reuse the same seq, which no later reader can untangle.
+    return withDataDirLock(dirname(this.filePath), () => {
+      this.syncTail();
+      const { ts, ...rest } = entry;
+      const unhashed: Omit<LedgerRecord, "hash"> = {
+        ...rest,
+        seq: this.lastSeq + 1,
+        ts: ts ?? new Date().toISOString(),
+        prev_hash: this.lastHash
+      };
+      const record: LedgerRecord = { ...unhashed, hash: hashRecord(unhashed) };
+      appendFileSync(this.filePath, JSON.stringify(record) + "\n", "utf8");
+      this.lastSeq = record.seq;
+      this.lastHash = record.hash;
+      return record;
+    });
   }
 
   get head(): { seq: number; hash: string } {

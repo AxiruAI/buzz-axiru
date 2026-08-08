@@ -32,22 +32,23 @@
 
 import { sha256Fingerprint } from "@axiru/agent-spend-guardrails";
 
-import { isExpired, type ApprovalRequest } from "./approvals.js";
+import { ApprovalQueueFullError, isExpired, type ApprovalRequest } from "./approvals.js";
 import { extractPayment, isGatedTool, type BridgeConfig } from "./config.js";
 import { DownstreamError, type DownstreamTool } from "./downstream.js";
 import { DownstreamPool } from "./pool.js";
 import type { Bridge, SpendRequest } from "./guard.js";
 import {
   errorResponse,
+  jsonShapeProblem,
   LATEST_PROTOCOL_VERSION,
   response,
+  serveNdjson,
   SUPPORTED_PROTOCOL_VERSIONS,
   TOOL_DEFINITION,
   TOOL_NAME,
   type JsonRpcRequest
 } from "./mcp.js";
 import { notifyApprovalDecided, notifyApprovalRequested } from "./notify.js";
-import { createInterface } from "node:readline";
 
 const UNATTRIBUTED_PUBKEY = "0".repeat(64);
 
@@ -142,11 +143,49 @@ export class GateServer {
             "that move money.\n"
         );
       }
+      // The fail-closed rule only covers a MISSING matcher. Once
+      // payment_tools is set it is an allowlist of gated names, and a
+      // money tool the operator did not list passes straight through.
+      // Two shapes of that mistake are worth shouting about at startup.
+      if (!this.gateAll && gated.length === 0) {
+        process.stderr.write(
+          "buzz-axiru gate: WARNING: payment_tools is configured but NOT ONE of the " +
+            `${this.downstreamTools.length} downstream tools matches a gate pattern. ` +
+            "Nothing is being gated: every tool, including any that moves money, passes " +
+            "straight through. Check payment_tools.gate against the tool names above.\n"
+        );
+      }
+      if (!this.gateAll) {
+        const unprefixed = this.downstream.servers
+          .filter((server) => server.tool_prefix === "")
+          .map((server) => server.name);
+        if (unprefixed.length > 0) {
+          process.stderr.write(
+            `buzz-axiru gate: NOTE: server(s) ${unprefixed.join(", ")} expose tools under ` +
+              "names the server itself chooses, and the gate patterns match those names. " +
+              "A server that renames a tool leaves the gate. Set a \"tool_prefix\" and gate " +
+              "the prefix if that server moves money.\n"
+          );
+        }
+      }
       if (this.agentPubkey === UNATTRIBUTED_PUBKEY) {
         process.stderr.write(
           "buzz-axiru gate: WARNING: no agent identity configured " +
             "(BUZZ_AXIRU_AGENT_PUBKEY or agent_pubkey). Decisions are attributed " +
             "to the all-zeros pubkey, so all unattributed agents share one daily cap.\n"
+        );
+      }
+      // One line, once, because the default is convenient and lossy:
+      // every downstream child sees the bridge's own signing key.
+      const inheriting = this.downstream.servers.filter(
+        (server) => (server.env_passthrough ?? "all") === "all"
+      );
+      if (inheriting.length > 0 && process.env.BUZZ_PRIVATE_KEY !== undefined) {
+        process.stderr.write(
+          `buzz-axiru gate: NOTE: ${inheriting.map((s) => s.name).join(", ")} inherit this ` +
+            "process's full environment, BUZZ_PRIVATE_KEY included. Set " +
+            "\"env_passthrough\": \"none\" (or a list of variable names) on servers that " +
+            "do not need it.\n"
         );
       }
     }
@@ -168,6 +207,18 @@ export class GateServer {
 
   /** Handle one JSON-RPC message from the agent. Null for notifications. */
   async handleMessage(raw: string): Promise<string | null> {
+    try {
+      return await this.dispatch(raw);
+    } catch (err) {
+      // The agent is untrusted, and an unhandled rejection out of here
+      // ends the serve loop and the process with it. Every gate that
+      // dies is a gate that stops gating, so failures become protocol
+      // errors instead.
+      return errorResponse(null, -32603, `Internal error: ${(err as Error).message}`);
+    }
+  }
+
+  private async dispatch(raw: string): Promise<string | null> {
     let message: JsonRpcRequest;
     try {
       message = JSON.parse(raw) as JsonRpcRequest;
@@ -258,6 +309,12 @@ export class GateServer {
     const args = (params.arguments ?? {}) as Record<string, unknown>;
     if (typeof name !== "string") {
       return errorResponse(id, -32602, "tools/call requires a tool name");
+    }
+    // Checked before anything walks the arguments: the fingerprint,
+    // the memo, and the policy evaluator all recurse over this object.
+    const shapeProblem = jsonShapeProblem(args);
+    if (shapeProblem !== null) {
+      return errorResponse(id, -32602, `tools/call rejected: ${shapeProblem}`);
     }
 
     // The advisory tool keeps working in gate mode.
@@ -590,7 +647,9 @@ export class GateServer {
         ts: now.toISOString()
       });
     }
-    const approval = this.bridge.approvals.createOrGet(
+    let approval: ApprovalRequest;
+    try {
+      approval = this.bridge.approvals.createOrGet(
       {
         fingerprint: callFingerprint,
         agent_pubkey: this.agentPubkey,
@@ -608,8 +667,46 @@ export class GateServer {
             }
           : {})
       },
-      now
-    );
+      now,
+      this.config.max_pending_approvals
+      );
+    } catch (err) {
+      if (!(err instanceof ApprovalQueueFullError)) throw err;
+      // FAIL CLOSED: no room to park it means nobody can approve it,
+      // so the call is refused outright rather than dropped on the
+      // floor with a pending-looking answer.
+      this.bridge.ledger.append({
+        type: "decision",
+        actor: this.agentPubkey,
+        agent_pubkey: this.agentPubkey,
+        decision: "deny",
+        reason_code: "bridge.deny.approval_queue_full",
+        amount_minor_units: details.amount_minor_units,
+        currency: details.currency,
+        counterparty: details.counterparty,
+        memo: details.memo,
+        fingerprint: callFingerprint,
+        tool_name: name,
+        note: err.message,
+        ts: now.toISOString()
+      });
+      return response(
+        id,
+        textResult(
+          {
+            status: "denied_by_policy",
+            executed: false,
+            decision: "deny",
+            reason_code: "bridge.deny.approval_queue_full",
+            error: err.message,
+            guidance:
+              "The approval queue is full, so this payment tool call was refused and NOT executed. " +
+              "Stop issuing payment calls and ask a human to clear the queue."
+          },
+          true
+        )
+      );
+    }
     await notifyApprovalRequested(this.config, approval);
     return response(
       id,
@@ -722,9 +819,15 @@ export class GateServer {
   /** Replay one granted parked call against the downstream server. */
   private async executeApproved(approval: ApprovalRequest, now: Date): Promise<ApprovalRequest> {
     if (this.executing.has(approval.approval_id)) return approval;
+    if (approval.call === undefined) {
+      // An advisory-mode approval that shares this data directory has
+      // no parked call. Nothing to replay, and inventing one would be
+      // executing something no human ever saw.
+      return approval;
+    }
     this.executing.add(approval.approval_id);
     try {
-      const call = approval.call!;
+      const call = approval.call;
       const meta = {
         approval_id: approval.approval_id,
         fingerprint: approval.fingerprint,
@@ -789,13 +892,6 @@ export class GateServer {
 
   /** Serve newline-delimited JSON-RPC on stdin/stdout until stdin closes. */
   async serveStdio(): Promise<void> {
-    const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
-    for await (const line of rl) {
-      if (line.trim().length === 0) continue;
-      const reply = await this.handleMessage(line);
-      if (reply !== null) {
-        process.stdout.write(reply + "\n");
-      }
-    }
+    await serveNdjson(process.stdin, process.stdout, (line) => this.handleMessage(line));
   }
 }

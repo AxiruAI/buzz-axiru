@@ -15,6 +15,11 @@
  *   - Tool name collisions across servers are a startup error, never a
  *     silent winner: which server got the call would otherwise depend
  *     on config ordering, and one of them may move money.
+ *   - A tool name containing control characters is a startup error.
+ *     The name is what the operator's gate patterns are written
+ *     against and what appears in the ledger and in the approval a
+ *     human reads; a newline in it is either a broken server or a
+ *     server trying to make its money tool unreadable.
  *   - alive is true only when every child is alive, so a dead child
  *     cannot hide behind its healthy siblings.
  *
@@ -52,6 +57,7 @@ export class DownstreamPool {
         command: config.command,
         args: config.args,
         env: config.env,
+        env_passthrough: config.env_passthrough,
         request_timeout_ms: config.request_timeout_ms
       })
     }));
@@ -146,6 +152,13 @@ export class DownstreamPool {
       const hide = new Set(member.config.hide_tools);
       const tools = await member.client.listTools();
       for (const tool of tools) {
+        if (typeof tool.name !== "string" || CONTROL_CHARS.test(tool.name)) {
+          throw new DownstreamError(
+            `buzz-axiru: downstream server "${member.config.name}" advertised a tool whose name ` +
+              "contains a control character. Refusing to run: that name cannot be matched " +
+              "against gate patterns or shown to a human approver truthfully."
+          );
+        }
         // hide_tools is matched before prefixing: the operator writes it
         // against the names that server's own docs use.
         if (hide.has(tool.name)) continue;
@@ -238,6 +251,8 @@ export class DownstreamPool {
     for (const member of this.members) member.client.close();
   }
 }
+
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 
 function capabilityKey(method: string): string {
   const slash = method.indexOf("/");

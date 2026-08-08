@@ -77,7 +77,13 @@ export class Bridge {
     if (typeof request.agent_pubkey !== "string" || !isPlausiblePubkey(request.agent_pubkey)) {
       return "agent_pubkey must be the agent's Nostr pubkey (64-char lowercase hex, or npub form)";
     }
-    const pinned = process.env.BUZZ_AXIRU_AGENT_PUBKEY;
+    // The env var wins, then policies.json. Reading only the env var
+    // meant an operator who pinned agent_pubkey in the config file got
+    // no pinning at all in advisory mode, while gate mode honoured it:
+    // the per-agent daily cap is keyed on this string, so an unpinned
+    // advisory bridge lets an agent reset its own cap by picking a
+    // different pubkey on the next call.
+    const pinned = process.env.BUZZ_AXIRU_AGENT_PUBKEY ?? this.config.agent_pubkey;
     if (pinned && pinned !== request.agent_pubkey) {
       return `agent_pubkey does not match the pinned identity this bridge instance was started for`;
     }
@@ -230,7 +236,8 @@ export class Bridge {
             ? { expires_at: new Date(clock.getTime() + this.config.approval_ttl_seconds * 1000).toISOString() }
             : {})
         },
-        clock
+        clock,
+        this.config.max_pending_approvals
       );
       await notifyApprovalRequested(this.config, approval);
       return this.decisionResult(request, result.fingerprint, result.decision_id, clock, {

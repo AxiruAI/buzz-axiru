@@ -131,6 +131,8 @@ export function buildQuickstartPolicies(shell: DetectedShell | null): string {
     payment_tools: starter["$payment_tools_example"],
     approval_ttl_seconds: starter["approval_ttl_seconds"],
     $approval_ttl_comment: starter["$approval_ttl_comment"],
+    max_pending_approvals: starter["max_pending_approvals"],
+    $max_pending_comment: starter["$max_pending_comment"],
     agent_pubkey: null,
     $agent_pubkey_comment: starter["$agent_pubkey_comment"],
     buzz: starter["buzz"],

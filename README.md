@@ -364,13 +364,20 @@ Read this section before trusting the gate with anything.
   payment tool missing from `payment_tools.gate` passes through ungated
   (unless you omit the matcher entirely, in which case everything is gated).
   Review the downstream server's tool list when you configure it, and again
-  when you upgrade it.
-- This is a local, single-process gate: one bridge, one data directory, files
-  on disk. It can front several downstream servers at once, but they all share
-  that single process and ledger. It is not the
-  hosted product's multi-rail enforcement, queue, or replication. The serve
-  process and the approve/deny CLI may interleave ledger writes; truly
-  concurrent writers are not supported.
+  when you upgrade it. The gate warns at startup when a configured matcher
+  gates none of the tools it can see. Note also that gate patterns match the
+  exposed tool name, and without a `tool_prefix` that name is chosen by the
+  downstream server: a server that renames its payment tool leaves the gate.
+  Set a `tool_prefix` on any server that moves money and gate the prefix.
+- This is a local gate: one data directory, files on disk. It can front
+  several downstream servers at once, but they all share one ledger. It is not
+  the hosted product's multi-rail enforcement, queue, or replication. The serve
+  process and the approve/deny CLI interleave writes safely, because every
+  ledger append and every approval-store update is taken under an exclusive
+  lock on the data directory (`<data_dir>/.lock`). A writer that cannot take
+  that lock within ten seconds fails loudly rather than writing anyway. Point
+  two bridges at one data directory and they will serialize, not corrupt each
+  other, but they will also contend.
 - In gate mode the agent identity comes from the operator's configuration
   (`BUZZ_AXIRU_AGENT_PUBKEY` per instance), not from anything the agent
   proves cryptographically. In advisory mode `agent_pubkey` is self-reported
@@ -379,10 +386,29 @@ Read this section before trusting the gate with anything.
   downstream server treats a replay differently over time (price changes,
   idempotency windows), the human should approve promptly; the TTL exists to
   keep stale intents from executing.
+- The ledger is tamper-EVIDENT, not tamper-PROOF. `buzz-axiru verify`
+  re-derives the whole chain and names the first bad record, so an edit, a
+  reorder, a deletion, or a mid-file truncation is caught. It cannot catch
+  anyone who can write `data_dir`, because that person can recompute a
+  consistent chain from genesis, and it cannot by itself catch a truncation
+  of the tail. Copy the head hash somewhere the agent cannot write (the Buzz
+  channel post already carries one per decision) if you need either.
 - Business-hours policy knows hours and timezones, not weekends or holidays.
 - The channel-post adapter shells out to the `buzz` CLI; if the CLI is absent
   or the relay is down, the approval still exists locally and is listed by
-  `buzz-axiru pending`, but nobody gets pinged.
+  `buzz-axiru pending`, but nobody gets pinged. The CLI is invoked with an
+  argv array and no shell, and every agent-supplied field in the message
+  (memo, counterparty, amounts) is flattened to one line first, so an agent
+  cannot forge extra lines in what the approver reads.
+- Downstream children inherit the bridge's full environment by default, which
+  includes `BUZZ_PRIVATE_KEY` and any other server's API keys. Set
+  `"env_passthrough": "none"` (or a list of variable names) per downstream
+  entry to narrow that. The default is unchanged from 0.2 so upgrades do not
+  break, but it is the wrong default for a multi-server setup.
+- The pending-approval queue is bounded by `max_pending_approvals` (default
+  500). At the ceiling, gated calls are refused with
+  `bridge.deny.approval_queue_full` rather than parked, because an agent that
+  varies its arguments otherwise chooses how long the queue gets.
 - If the downstream server crashes, gated and passthrough calls return
   errors (never hang) and the child is not auto-restarted; restart the
   bridge.

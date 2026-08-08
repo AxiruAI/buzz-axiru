@@ -34,6 +34,7 @@ function server(
     command: process.execPath,
     args: [MULTI_PATH],
     env: { FAKE_MULTI_NAME: name, FAKE_MULTI_TOOLS: tools.join(","), ...extraEnv },
+    env_passthrough: "all",
     request_timeout_ms: 5000,
     hide_tools: [],
     tool_prefix: "",

@@ -57,6 +57,8 @@ export const STARTER_POLICIES = `{
       "command": "npx",
       "args": ["-y", "@stripe/mcp", "--tools=all"],
       "env": { "STRIPE_SECRET_KEY": "sk_test_..." },
+      "env_passthrough": "none",
+      "$env_passthrough_comment": "Which of the bridge's own environment variables this child inherits: all (the default, and what every version before 0.3 did), none, or a list of variable names. Passing everything hands this server the bridge's BUZZ_PRIVATE_KEY and every other server's API keys, so narrow it when you run more than one downstream server.",
       "tool_prefix": "pay_",
       "request_timeout_ms": 30000,
       "hide_tools": []
@@ -82,6 +84,9 @@ export const STARTER_POLICIES = `{
 
   "approval_ttl_seconds": 86400,
   "$approval_ttl_comment": "How long a parked approval stays decidable, in seconds. After this it expires: it can no longer be granted and is never executed. null disables expiry (not recommended).",
+
+  "max_pending_approvals": 500,
+  "$max_pending_comment": "Ceiling on approvals waiting on a human at once. The agent picks the tool arguments, so the agent picks how many distinct approvals exist; past this ceiling gated calls are refused outright rather than growing a queue nobody will read. null disables the ceiling (not recommended).",
 
   "agent_pubkey": null,
   "$agent_pubkey_comment": "The Nostr pubkey (64-char hex) decisions are attributed to in gate mode. Usually set per instance via BUZZ_AXIRU_AGENT_PUBKEY instead. If neither is set, decisions attribute to the all-zeros pubkey and all unattributed agents share one daily cap.",

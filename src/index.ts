@@ -25,7 +25,7 @@ export {
   type ExtractionResult
 } from "./config.js";
 export { GateServer, type GateOptions } from "./gate.js";
-export { DownstreamClient, DownstreamError, type DownstreamTool } from "./downstream.js";
+export { DownstreamClient, DownstreamError, childEnv, type DownstreamTool } from "./downstream.js";
 export { DownstreamPool } from "./pool.js";
 export {
   Ledger,
@@ -38,11 +38,13 @@ export {
 } from "./ledger.js";
 export {
   ApprovalStore,
+  ApprovalQueueFullError,
   approvalIdForFingerprint,
+  legacyApprovalIdForFingerprint,
   isExpired,
   type ApprovalRequest,
   type ParkedCall
 } from "./approvals.js";
 export { STARTER_POLICIES } from "./scaffold.js";
-export { McpServer, TOOL_DEFINITION, TOOL_NAME } from "./mcp.js";
-export { formatAmount } from "./notify.js";
+export { McpServer, jsonShapeProblem, serveNdjson, TOOL_DEFINITION, TOOL_NAME } from "./mcp.js";
+export { formatAmount, sanitizeForChannel } from "./notify.js";

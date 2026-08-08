@@ -21,6 +21,17 @@
  * logged, never thrown: notification is best-effort, the decision and
  * the ledger record already happened.
  *
+ * The approval text is the only thing most humans will read before
+ * releasing money, and several of its fields (memo, counterparty, the
+ * unreadable-amount placeholder) come from the agent's own tool
+ * arguments. A prompt-injected agent that can put a newline in a memo
+ * can forge any other line of this message, including a smaller
+ * amount and a different approval id in the "To decide" line. So every
+ * interpolated field is flattened to a single line and truncated
+ * before it reaches the text. The buzz CLI is invoked with execFile
+ * and an argv array, never a shell string, so the same fields cannot
+ * reach a shell either.
+ *
  * Licensed under the Apache License, Version 2.0.
  */
 
@@ -28,6 +39,20 @@ import { execFile } from "node:child_process";
 
 import type { BridgeConfig } from "./config.js";
 import type { ApprovalRequest } from "./approvals.js";
+
+/** Longest an untrusted field may be in the human-facing text. */
+const MAX_FIELD_CHARS = 200;
+
+/**
+ * Flatten one untrusted field for display. Control characters (newline
+ * and carriage return above all) are replaced rather than dropped, so
+ * an attempt to forge a line is visible in the message instead of
+ * silently disappearing.
+ */
+export function sanitizeForChannel(value: string, maxChars: number = MAX_FIELD_CHARS): string {
+  const flattened = String(value).replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, "\uFFFD");
+  return flattened.length > maxChars ? flattened.slice(0, maxChars) + "..." : flattened;
+}
 
 const CURRENCY_EXPONENT: Record<string, number> = {
   USD: 2,
@@ -53,16 +78,17 @@ export function formatAmount(minorUnits: string, currency: string): string {
 }
 
 export function approvalRequestText(approval: ApprovalRequest): string {
+  const s = sanitizeForChannel;
   return [
     "[buzz-axiru] Spend approval needed",
-    `  agent:        ${approval.agent_pubkey}`,
-    `  amount:       ${formatAmount(approval.amount_minor_units, approval.currency)} (${approval.amount_minor_units} minor units)`,
-    `  counterparty: ${approval.counterparty}`,
-    `  memo:         ${approval.memo}`,
-    `  reason:       ${approval.reason_code}`,
-    `  approval id:  ${approval.approval_id}`,
+    `  agent:        ${s(approval.agent_pubkey)}`,
+    `  amount:       ${s(formatAmount(approval.amount_minor_units, approval.currency))} (${s(approval.amount_minor_units)} minor units)`,
+    `  counterparty: ${s(approval.counterparty)}`,
+    `  memo:         ${s(approval.memo)}`,
+    `  reason:       ${s(approval.reason_code)}`,
+    `  approval id:  ${s(approval.approval_id)}`,
     "",
-    `To decide: buzz-axiru approve ${approval.approval_id}   or   buzz-axiru deny ${approval.approval_id}`
+    `To decide: buzz-axiru approve ${s(approval.approval_id)}   or   buzz-axiru deny ${s(approval.approval_id)}`
   ].join("\n");
 }
 
@@ -73,24 +99,28 @@ export function approvalOutcomeText(approval: ApprovalRequest): string {
       : approval.status === "expired"
         ? "EXPIRED (never executed)"
         : "DENIED";
+  const s = sanitizeForChannel;
   return [
     `[buzz-axiru] Spend ${verb}`,
-    `  approval id:  ${approval.approval_id}`,
-    `  agent:        ${approval.agent_pubkey}`,
-    `  amount:       ${formatAmount(approval.amount_minor_units, approval.currency)}`,
-    `  counterparty: ${approval.counterparty}`,
-    ...(approval.status !== "expired" ? [`  decided by:   ${approval.decided_by ?? "unknown"}`] : []),
-    ...(approval.call !== undefined ? [`  gated tool:   ${approval.call.tool_name}`] : []),
+    `  approval id:  ${s(approval.approval_id)}`,
+    `  agent:        ${s(approval.agent_pubkey)}`,
+    `  amount:       ${s(formatAmount(approval.amount_minor_units, approval.currency))}`,
+    `  counterparty: ${s(approval.counterparty)}`,
+    ...(approval.status !== "expired" ? [`  decided by:   ${s(approval.decided_by ?? "unknown")}`] : []),
+    ...(approval.call !== undefined ? [`  gated tool:   ${s(approval.call.tool_name)}`] : []),
     ...(approval.execution_status !== undefined
-      ? [`  execution:    ${approval.execution_status}`]
+      ? [`  execution:    ${s(approval.execution_status)}`]
       : []),
-    ...(approval.note ? [`  note:         ${approval.note}`] : [])
+    ...(approval.note ? [`  note:         ${s(approval.note)}`] : [])
   ].join("\n");
 }
 
 function postToBuzzChannel(config: BridgeConfig, text: string): Promise<void> {
   return new Promise((resolvePromise) => {
     if (!config.buzz.channel_id) return resolvePromise();
+    // execFile with an argv array and no shell option: nothing in
+    // `text` is ever interpreted by a shell. shell:false is the
+    // default and is deliberately not overridden.
     execFile(
       config.buzz.cli_path,
       ["messages", "send", "--channel", config.buzz.channel_id, "--content", text],

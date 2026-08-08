@@ -3,6 +3,13 @@
  * server as a child process and speaks newline-delimited JSON-RPC 2.0
  * to it over stdio.
  *
+ * The downstream server is operator-chosen, but what it writes on
+ * stdout is not necessarily under the operator's control: it is a
+ * payment API's answers, an upstream service's error text, or in the
+ * worst case a compromised server. So its output is read with a hard
+ * line cap and its environment is whatever the operator said to give
+ * it, no more.
+ *
  * Failure semantics, chosen deliberately:
  *   - If the child exits or errors, every in-flight request is
  *     rejected immediately (never a hang), and every later request
@@ -17,7 +24,6 @@
  */
 
 import { spawn, type ChildProcessByStdio } from "node:child_process";
-import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
 
 type Child = ChildProcessByStdio<Writable, Readable, null>;
@@ -50,7 +56,30 @@ export interface DownstreamSpawnSpec {
   command: string;
   args: string[];
   env: Record<string, string>;
+  /** See DownstreamConfig.env_passthrough. Defaults to "all". */
+  env_passthrough?: "all" | "none" | string[];
   request_timeout_ms: number;
+}
+
+/**
+ * Longest line accepted from a downstream server's stdout. A server
+ * that never emits a newline would otherwise make the gate buffer
+ * without limit; the gate is the process that must stay alive.
+ */
+export const MAX_DOWNSTREAM_LINE_CHARS = 8_388_608;
+
+/** Build the child's environment from the operator's passthrough choice. */
+export function childEnv(spec: DownstreamSpawnSpec): NodeJS.ProcessEnv {
+  const mode = spec.env_passthrough ?? "all";
+  if (mode === "all") return { ...process.env, ...spec.env };
+  const base: NodeJS.ProcessEnv = {};
+  if (Array.isArray(mode)) {
+    for (const name of mode) {
+      const value = process.env[name];
+      if (value !== undefined) base[name] = value;
+    }
+  }
+  return { ...base, ...spec.env };
 }
 
 export class DownstreamClient {
@@ -77,7 +106,7 @@ export class DownstreamClient {
   /** Spawn the child and run the MCP initialize handshake. */
   async start(protocolVersion: string, clientVersion: string): Promise<void> {
     this.child = spawn(this.spec.command, this.spec.args, {
-      env: { ...process.env, ...this.spec.env },
+      env: childEnv(this.spec),
       // stderr is inherited so the operator sees downstream logs.
       stdio: ["pipe", "pipe", "inherit"]
     });
@@ -91,8 +120,7 @@ export class DownstreamClient {
       );
     });
 
-    const rl = createInterface({ input: this.child.stdout, crlfDelay: Infinity });
-    rl.on("line", (line) => this.onLine(line));
+    this.readLines(this.child.stdout);
 
     const init = (await this.request("initialize", {
       protocolVersion,
@@ -103,6 +131,40 @@ export class DownstreamClient {
     this.capabilities = (init.capabilities as Record<string, unknown>) ?? {};
     this.instructions = typeof init.instructions === "string" ? init.instructions : undefined;
     this.notify("notifications/initialized");
+  }
+
+  /**
+   * Newline-split the child's stdout with a cap on line length. An
+   * over-long line is dropped with a note on stderr rather than
+   * buffered: the request it belonged to then fails on its own timeout,
+   * which is the same outcome as a silent server and a much better one
+   * than the gate running out of memory.
+   */
+  private readLines(stream: Readable): void {
+    let buffer = "";
+    let discarding = false;
+    stream.setEncoding("utf8");
+    stream.on("data", (chunk: string) => {
+      buffer += chunk;
+      for (;;) {
+        const newline = buffer.indexOf("\n");
+        if (newline === -1) break;
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        if (discarding) {
+          discarding = false;
+          continue;
+        }
+        this.onLine(line);
+      }
+      if (buffer.length > MAX_DOWNSTREAM_LINE_CHARS) {
+        buffer = "";
+        discarding = true;
+        process.stderr.write(
+          `buzz-axiru: downstream server emitted a line over ${MAX_DOWNSTREAM_LINE_CHARS} characters; discarded it\n`
+        );
+      }
+    });
   }
 
   private markDead(reason: string): void {

@@ -1,0 +1,166 @@
+/**
+ * Exclusive advisory lock over the data directory.
+ *
+ * The ledger append path is read-tail-then-append and the approval
+ * store is read-modify-write; both were safe only while exactly one
+ * process touched a data directory. That was never true in practice:
+ * the gate `serve` process appends on every gated call while the
+ * operator runs `buzz-axiru approve` from a second process, and the
+ * two interleave. Measured consequences, not theoretical ones:
+ * duplicated seq numbers, torn half-written lines that make
+ * `syncTail` throw, and a chain that `verify` rejects forever. On the
+ * approval store, a lost update can resurrect an approval that the
+ * other process had already expired.
+ *
+ * So: one lockfile per data directory, held across each critical
+ * section. O_EXCL create is the primitive because it is atomic on
+ * every filesystem we care about and needs no dependency.
+ *
+ * Choices worth stating:
+ *   - FAIL LOUDLY. On contention past the timeout this throws rather
+ *     than proceeding unlocked. A spend gate that silently corrupts
+ *     its own audit trail is worse than one that refuses to act.
+ *   - Stale locks are reclaimed, because a killed gate must not wedge
+ *     the operator's CLI forever: a lock whose owner pid is gone on
+ *     this host, or whose heartbeat is older than STALE_AFTER_MS, is
+ *     removed and the caller retries.
+ *   - Reentrant within a process, so a future caller that nests two
+ *     locked sections cannot deadlock against itself.
+ *   - Synchronous, because the writers it protects are synchronous
+ *     (appendFileSync, renameSync) and making them async would widen
+ *     every window this exists to close.
+ *
+ * Licensed under the Apache License, Version 2.0.
+ */
+
+import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync } from "node:fs";
+import { hostname } from "node:os";
+import { join } from "node:path";
+
+export const LOCK_FILE_NAME = ".lock";
+
+/** How long to wait for a contended lock before giving up loudly. */
+const DEFAULT_TIMEOUT_MS = 10_000;
+/** A lock older than this with no live owner is treated as abandoned. */
+const STALE_AFTER_MS = 60_000;
+/** Poll interval while waiting. Short: critical sections are microseconds. */
+const RETRY_MS = 5;
+
+interface LockOwner {
+  pid: number;
+  host: string;
+  at: number;
+}
+
+/**
+ * Reentrancy bookkeeping, keyed by lock path. A process that already
+ * holds the lock just counts deeper instead of blocking on itself.
+ */
+const held = new Map<string, number>();
+
+/** Sleep without yielding to the event loop; the callers are sync. */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function readOwner(lockPath: string): LockOwner | null {
+  try {
+    const parsed = JSON.parse(readFileSync(lockPath, "utf8")) as Partial<LockOwner>;
+    if (typeof parsed.pid !== "number" || typeof parsed.at !== "number") return null;
+    return { pid: parsed.pid, host: typeof parsed.host === "string" ? parsed.host : "", at: parsed.at };
+  } catch {
+    // Unreadable or half-written: treat as unknown owner, not as free.
+    return null;
+  }
+}
+
+/** Signal 0 probes liveness without delivering anything. */
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM means the pid exists but belongs to another user.
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function isStale(owner: LockOwner | null, now: number): boolean {
+  if (owner === null) return false;
+  if (owner.host === hostname() && !pidAlive(owner.pid)) return true;
+  return now - owner.at > STALE_AFTER_MS;
+}
+
+/** Acquire the lock, blocking until it is ours or the timeout expires. */
+function acquire(lockPath: string, timeoutMs: number): void {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      // "wx" is O_CREAT|O_EXCL: exactly one racer creates the file.
+      const fd = openSync(lockPath, "wx");
+      try {
+        const owner: LockOwner = { pid: process.pid, host: hostname(), at: Date.now() };
+        writeSync(fd, JSON.stringify(owner));
+      } finally {
+        closeSync(fd);
+      }
+      return;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+    const owner = readOwner(lockPath);
+    if (isStale(owner, Date.now())) {
+      try {
+        unlinkSync(lockPath);
+      } catch {
+        // Another waiter reclaimed it first; that is the same outcome.
+      }
+      continue;
+    }
+    if (Date.now() >= deadline) {
+      const who =
+        owner !== null ? `pid ${owner.pid} on ${owner.host || "an unknown host"}` : "an unknown process";
+      throw new Error(
+        `buzz-axiru: could not lock the data directory after ${timeoutMs}ms: ${lockPath} is held by ${who}. ` +
+          "Refusing to write the ledger or the approval store unlocked, because concurrent writers corrupt " +
+          "the hash chain. Stop the other buzz-axiru process, or delete the lock file if you are certain it is stale."
+      );
+    }
+    sleepSync(RETRY_MS);
+  }
+}
+
+function release(lockPath: string): void {
+  try {
+    unlinkSync(lockPath);
+  } catch {
+    // Already gone (reclaimed as stale while we held it). Nothing to undo.
+  }
+}
+
+/**
+ * Run `fn` while holding the data directory's exclusive lock. The lock
+ * is released even when `fn` throws, and the caller sees the original
+ * error rather than a lock error.
+ */
+export function withDataDirLock<T>(dataDir: string, fn: () => T, timeoutMs = DEFAULT_TIMEOUT_MS): T {
+  const lockPath = join(dataDir, LOCK_FILE_NAME);
+  const depth = held.get(lockPath) ?? 0;
+  if (depth > 0) {
+    held.set(lockPath, depth + 1);
+    try {
+      return fn();
+    } finally {
+      held.set(lockPath, (held.get(lockPath) ?? 1) - 1);
+    }
+  }
+  mkdirSync(dataDir, { recursive: true });
+  acquire(lockPath, timeoutMs);
+  held.set(lockPath, 1);
+  try {
+    return fn();
+  } finally {
+    held.set(lockPath, 0);
+    release(lockPath);
+  }
+}

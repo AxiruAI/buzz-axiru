@@ -70,8 +70,22 @@ export interface DownstreamConfig {
   name: string;
   command: string;
   args: string[];
-  /** Extra environment variables for the child (merged over process.env). */
+  /** Extra environment variables for the child (merged over env_passthrough). */
   env: Record<string, string>;
+  /**
+   * Which of the bridge's own environment variables the child inherits.
+   *
+   * "all" (the default, and the historical behaviour) hands the child
+   * every variable this process has, which means the bridge's Buzz
+   * signing key and one payment server's API key are both visible to
+   * every other downstream server the operator configures. That is a
+   * lot of trust to place in a server chosen for an unrelated job.
+   * "none" passes nothing but `env`, and an array names the variables
+   * to forward. Kept defaulting to "all" so existing configs do not
+   * break on upgrade; operators running more than one downstream
+   * server should narrow it.
+   */
+  env_passthrough: "all" | "none" | string[];
   /** Per-request timeout against the downstream server. Default 30000. */
   request_timeout_ms: number;
   /**
@@ -155,6 +169,15 @@ export interface BridgeConfig {
    */
   approval_ttl_seconds: number | null;
   /**
+   * Ceiling on how many approvals may sit pending at once. Each parked
+   * call is a distinct file entry and a distinct line in somebody's
+   * channel, and the agent chooses the arguments, so it also chooses
+   * how many distinct approvals exist. Past the ceiling the gate
+   * refuses new gated calls outright rather than growing a queue no
+   * human will ever read. Default 500; null disables the ceiling.
+   */
+  max_pending_approvals: number | null;
+  /**
    * The Nostr pubkey decisions are attributed to in gate mode, where
    * downstream tool calls carry no agent_pubkey argument. Overridden
    * by BUZZ_AXIRU_AGENT_PUBKEY. If neither is set the gate still fails
@@ -208,12 +231,13 @@ export function loadConfig(policiesPath?: string, dataDirOverride?: string): Bri
     currency,
     controls,
     buzz,
-    webhook_url: typeof doc.webhook_url === "string" ? doc.webhook_url : null,
+    webhook_url: parseWebhookUrl(doc.webhook_url, path),
     data_dir,
     config_path: path,
     downstream: parseDownstream(doc.downstream, path),
     payment_tools: parsePaymentTools(doc.payment_tools, path),
     approval_ttl_seconds: parseTtl(doc.approval_ttl_seconds, path),
+    max_pending_approvals: parseMaxPending(doc.max_pending_approvals, path),
     agent_pubkey: parseAgentPubkey(doc.agent_pubkey, path)
   };
 
@@ -281,12 +305,14 @@ function parseDownstreamEntry(raw: unknown, path: string, label: string): Downst
     }
     for (const [key, value] of Object.entries(d.env as Record<string, unknown>)) {
       if (key.startsWith("$")) continue;
+      if (isUnsafeKey(key)) continue;
       if (typeof value !== "string") {
         throw new Error(`buzz-axiru: ${path}: ${label}.env.${key} must be a string`);
       }
       env[key] = value;
     }
   }
+  const env_passthrough = parseEnvPassthrough(d.env_passthrough, path, label);
   const timeout =
     d.request_timeout_ms === undefined ? 30_000 : Number(d.request_timeout_ms);
   if (!Number.isFinite(timeout) || timeout <= 0) {
@@ -316,10 +342,36 @@ function parseDownstreamEntry(raw: unknown, path: string, label: string): Downst
     command: d.command,
     args: args as string[],
     env,
+    env_passthrough,
     request_timeout_ms: timeout,
     hide_tools: hide as string[],
     tool_prefix
   };
+}
+
+function parseEnvPassthrough(
+  raw: unknown,
+  path: string,
+  label: string
+): "all" | "none" | string[] {
+  if (raw === undefined || raw === null) return "all";
+  if (raw === "all" || raw === "none") return raw;
+  if (Array.isArray(raw) && raw.every((n) => typeof n === "string")) return raw as string[];
+  throw new Error(
+    `buzz-axiru: ${path}: ${label}.env_passthrough must be "all", "none", or an array of variable names`
+  );
+}
+
+/**
+ * Keys that would reach an object's prototype instead of the object
+ * when copied with plain assignment. Config is operator-written, but
+ * these maps are also indexed with names that come off the wire, so
+ * the cheap defence is to refuse the keys outright.
+ */
+const UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+export function isUnsafeKey(key: string): boolean {
+  return UNSAFE_KEYS.has(key);
 }
 
 function parsePaymentTools(raw: unknown, path: string): PaymentToolsConfig | null {
@@ -339,6 +391,7 @@ function parsePaymentTools(raw: unknown, path: string): PaymentToolsConfig | nul
     }
     for (const [key, value] of Object.entries(p.mappings as Record<string, unknown>)) {
       if (key.startsWith("$")) continue;
+      if (isUnsafeKey(key)) continue;
       if (typeof value !== "object" || value === null) {
         throw new Error(`buzz-axiru: ${path}: payment_tools.mappings["${key}"] must be an object`);
       }
@@ -367,6 +420,31 @@ function parsePaymentTools(raw: unknown, path: string): PaymentToolsConfig | nul
   return { gate: gate as string[], mappings };
 }
 
+/**
+ * The webhook is operator-set, so this is not an agent-facing control.
+ * It is still worth refusing anything that is not http(s): a config
+ * assembled by a template or a script has no business making the
+ * bridge read a file: URL and POST approval contents into it.
+ */
+function parseWebhookUrl(raw: unknown, path: string): string | null {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== "string") {
+    throw new Error(`buzz-axiru: ${path}: webhook_url must be a string or null`);
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`buzz-axiru: ${path}: webhook_url is not a valid URL`);
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(
+      `buzz-axiru: ${path}: webhook_url must be http: or https: (got "${parsed.protocol}")`
+    );
+  }
+  return raw;
+}
+
 function parseTtl(raw: unknown, path: string): number | null {
   if (raw === undefined) return 86_400;
   if (raw === null) return null;
@@ -375,6 +453,18 @@ function parseTtl(raw: unknown, path: string): number | null {
     throw new Error(`buzz-axiru: ${path}: approval_ttl_seconds must be a positive number or null`);
   }
   return ttl;
+}
+
+function parseMaxPending(raw: unknown, path: string): number | null {
+  if (raw === undefined) return 500;
+  if (raw === null) return null;
+  const max = Number(raw);
+  if (!Number.isInteger(max) || max <= 0) {
+    throw new Error(
+      `buzz-axiru: ${path}: max_pending_approvals must be a positive integer or null`
+    );
+  }
+  return max;
 }
 
 function parseAgentPubkey(raw: unknown, path: string): string | null {
@@ -391,13 +481,24 @@ function parseAgentPubkey(raw: unknown, path: string): string | null {
 /* Tool-name matching and payment extraction (gate mode)              */
 /* ------------------------------------------------------------------ */
 
-/** Glob match where "*" is the only wildcard (matches any run, including empty). */
+/**
+ * Glob match where "*" is the only wildcard (matches any run, including
+ * empty).
+ *
+ * The wildcard compiles to `[\s\S]*`, not `.*`. `.` does not match a
+ * newline, so a downstream server that named a tool "pay_a\nb" would
+ * slip past a "pay_*" gate pattern while still being callable by that
+ * exact name: the gate would treat a money tool as pass-through. The
+ * class form makes the wildcard mean what an operator reads it to mean.
+ * (Anchoring is already correct: JavaScript `$` without the `m` flag
+ * matches only at end of input, not before a trailing newline.)
+ */
 export function matchesPattern(pattern: string, name: string): boolean {
   const escaped = pattern
     .split("*")
     .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-    .join(".*");
-  return new RegExp(`^${escaped}$`).test(name);
+    .join("[\\s\\S]*");
+  return new RegExp(`^(?:${escaped})$`).test(name);
 }
 
 /**
@@ -425,11 +526,22 @@ export function mappingForTool(config: BridgeConfig, toolName: string): ToolMapp
   return null;
 }
 
-/** Dot-separated path lookup into a JSON arguments object. */
+/**
+ * Dot-separated path lookup into a JSON arguments object.
+ *
+ * Prototype keys are refused rather than followed. `JSON.parse` puts a
+ * literal "__proto__" key on the object as an own property, so a path
+ * through one would read from Object.prototype instead, which is both
+ * meaningless here and a way to make an amount appear where the agent
+ * never put one. Returning undefined routes the call to the fail-closed
+ * unextractable-amount branch, which is the right answer.
+ */
 export function getPath(obj: unknown, path: string): unknown {
   let current: unknown = obj;
   for (const segment of path.split(".")) {
     if (typeof current !== "object" || current === null) return undefined;
+    if (isUnsafeKey(segment)) return undefined;
+    if (!Object.prototype.hasOwnProperty.call(current, segment)) return undefined;
     current = (current as Record<string, unknown>)[segment];
   }
   return current;
