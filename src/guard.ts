@@ -104,6 +104,23 @@ export class Bridge {
     const clock = now ?? new Date();
     const currency = request.currency.toUpperCase();
 
+    // Single-currency invariant. The policy pack is denominated in
+    // config.currency and rolling-window history is scoped to it, so a
+    // request in any other currency cannot be evaluated without a silent
+    // cross-currency comparison that fails OPEN (the daily cap and
+    // aggregates never see the foreign amount). Fail closed instead. In
+    // gate mode this throw is caught and parked as require_approval; the
+    // gate also screens currency before it ever gets here, so this is the
+    // backstop for the advisory tool and the CLI decide path.
+    const policyCurrency = this.config.currency.toUpperCase();
+    if (currency !== policyCurrency) {
+      throw new TypeError(
+        `buzz-axiru: request currency ${currency} does not match the policy currency ` +
+          `${policyCurrency}; this bridge evaluates a single currency and cannot compare ` +
+          "cross-currency spend"
+      );
+    }
+
     const history = historyForAgent(
       this.ledger.filePath,
       request.agent_pubkey,

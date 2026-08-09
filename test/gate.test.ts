@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 import { loadConfig } from "../src/config.js";
 import { GateServer } from "../src/gate.js";
 import { Bridge } from "../src/guard.js";
-import { verifyLedger, type LedgerRecord } from "../src/ledger.js";
+import { historyForAgent, verifyLedger, type LedgerRecord } from "../src/ledger.js";
 import { AGENT_PUBKEY, NOON_UTC, seedAllow } from "./helpers.js";
 
 const FAKE_PATH = fileURLToPath(new URL("./fake-downstream.js", import.meta.url));
@@ -318,6 +318,119 @@ test("gated call with an unextractable amount fails closed to require_approval",
     const negative = await callTool(ctx.gate, "create_payment", { ...PAYMENT, amount: -5 });
     assert.equal(toolText(negative.result!).reason_code, "bridge.pending.amount_unextractable");
     assert.equal(downstreamCalls(ctx.logPath).length, 0);
+  } finally {
+    ctx.close();
+  }
+});
+
+test("a foreign-currency gated call is parked, not allowed, and never reaches downstream", async () => {
+  const ctx = await makeGate();
+  try {
+    seedAllow(ctx.bridge, "50000", new Date(NOON_UTC.getTime() - HOUR));
+    // A huge JPY amount that would sail past a USD-scoped daily cap: the
+    // cap only ever sees USD history, so a raw or skipped comparison here
+    // fails open. It must park instead.
+    const reply = await callTool(ctx.gate, "create_payment", {
+      amount: 99999999999,
+      currency: "JPY",
+      destination: "acme-datacenter.example"
+    });
+    const body = toolText(reply.result!);
+    assert.equal(body.status, "pending_approval");
+    assert.equal(body.executed, false);
+    assert.equal(body.reason_code, "bridge.pending.currency_mismatch");
+    assert.equal(downstreamCalls(ctx.logPath).length, 0, "foreign currency must never execute");
+
+    // The park is recorded as require_approval in the currency the agent
+    // sent, so nothing pretends the JPY amount was a USD amount.
+    const records = ledgerRecords(ctx.ledgerPath);
+    const decision = records.find(
+      (r) => r.type === "decision" && r.reason_code === "bridge.pending.currency_mismatch"
+    );
+    assert.ok(decision);
+    assert.equal(decision!.decision, "require_approval");
+    assert.equal(decision!.currency, "JPY");
+    // No allow decision and no execution ever entered the ledger.
+    assert.equal(records.some((r) => r.type === "execution"), false);
+    assert.equal(
+      records.some((r) => r.type === "decision" && r.decision === "allow" && r.tool_name),
+      false
+    );
+  } finally {
+    ctx.close();
+  }
+});
+
+test("a gated call whose currency field is missing fails closed to require_approval", async () => {
+  const ctx = await makeGate();
+  try {
+    seedAllow(ctx.bridge, "50000", new Date(NOON_UTC.getTime() - HOUR));
+    // currency_field is configured ("currency") but the agent omitted it.
+    const reply = await callTool(ctx.gate, "create_payment", {
+      amount: 12000,
+      destination: "acme-datacenter.example"
+      // currency missing entirely
+    });
+    const body = toolText(reply.result!);
+    assert.equal(body.status, "pending_approval");
+    assert.equal(body.reason_code, "bridge.pending.currency_unextractable");
+    assert.equal(downstreamCalls(ctx.logPath).length, 0, "unreadable currency must never execute");
+
+    // An empty-string currency is unreadable the same way.
+    const empty = await callTool(ctx.gate, "create_payment", {
+      amount: 12000,
+      currency: "   ",
+      destination: "acme-datacenter.example"
+    });
+    assert.equal(toolText(empty.result!).reason_code, "bridge.pending.currency_unextractable");
+    assert.equal(downstreamCalls(ctx.logPath).length, 0);
+  } finally {
+    ctx.close();
+  }
+});
+
+test("a matching-currency gated call is unaffected by the currency guard", async () => {
+  const ctx = await makeGate();
+  try {
+    seedAllow(ctx.bridge, "50000", new Date(NOON_UTC.getTime() - HOUR));
+    // Lowercase "usd" still matches the uppercased policy currency.
+    const reply = await callTool(ctx.gate, "create_payment", {
+      amount: 12000,
+      currency: "usd",
+      destination: "acme-datacenter.example"
+    });
+    const body = toolText(reply.result!);
+    assert.equal(body.paid, true);
+    assert.equal(downstreamCalls(ctx.logPath).length, 1, "matching currency executes normally");
+  } finally {
+    ctx.close();
+  }
+});
+
+test("a foreign-currency execution does not pollute the USD daily-cap aggregates", async () => {
+  const ctx = await makeGate();
+  try {
+    seedAllow(ctx.bridge, "50000", new Date(NOON_UTC.getTime() - HOUR));
+    // Simulate a foreign-currency execution having somehow landed in the
+    // ledger: the USD-scoped aggregate must ignore it, so a foreign spend
+    // can never inflate (or be counted against) the USD daily cap.
+    ctx.bridge.ledger.append({
+      type: "execution",
+      actor: "bridge",
+      agent_pubkey: AGENT_PUBKEY,
+      reason_code: "bridge.execution.ok",
+      amount_minor_units: "99999999999",
+      currency: "JPY",
+      counterparty: "acme-datacenter.example",
+      memo: "foreign",
+      fingerprint: "sha256:" + "1a".repeat(32),
+      tool_name: "create_payment",
+      execution_status: "executed",
+      ts: new Date(NOON_UTC.getTime() - HOUR).toISOString()
+    });
+    const usd = historyForAgent(ctx.ledgerPath, AGENT_PUBKEY, "USD", NOON_UTC);
+    assert.equal(usd.amount_24h, "50000", "USD aggregate ignores the JPY execution");
+    assert.equal(usd.count_24h, 1);
   } finally {
     ctx.close();
   }

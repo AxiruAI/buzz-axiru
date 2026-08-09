@@ -409,6 +409,30 @@ export class GateServer {
       });
     }
 
+    // FAIL CLOSED: this policy pack is denominated in ONE currency
+    // (config.currency), and the daily cap, single-payment ceiling, and
+    // rolling-window aggregates are all scoped to it. A payment in any
+    // other currency cannot be compared against them: the guardrails
+    // engine would weigh the foreign amount against same-currency
+    // history that never includes it, so the per-agent daily cap silently
+    // never fires and the call fails OPEN. A raw cross-currency compare
+    // (100000 JPY treated as 100000 USD cents) is just as wrong. Park it
+    // for a human rather than allow an uncapped foreign-currency spend.
+    if (extraction.currency !== this.config.currency) {
+      return this.parkCall(id, name, args, callFingerprint, now, {
+        reason_code: "bridge.pending.currency_mismatch",
+        reason_text:
+          `payment currency ${extraction.currency} does not match the policy currency ` +
+          `${this.config.currency}; this policy pack evaluates a single currency and cannot ` +
+          "compare cross-currency spend, so the call is parked for human review",
+        amount_minor_units: extraction.amount_minor_units,
+        currency: extraction.currency,
+        counterparty: extraction.counterparty,
+        memo,
+        policy_fingerprint: undefined
+      });
+    }
+
     const request: SpendRequest = {
       amount_minor_units: extraction.amount_minor_units,
       currency: extraction.currency,

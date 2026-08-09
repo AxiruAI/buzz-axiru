@@ -40,7 +40,7 @@ import {
 } from "./quickstart.js";
 import { STARTER_POLICIES } from "./scaffold.js";
 
-const VERSION = "0.3.0";
+const VERSION = "0.3.1";
 
 interface ParsedArgs {
   command: string;
