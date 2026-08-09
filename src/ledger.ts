@@ -98,6 +98,8 @@ export interface LedgerEntryInput {
   execution_status?: "in_progress" | "executed" | "failed";
   /** For failed executions: the downstream error, verbatim. */
   error?: string;
+  /** Hash of a retained successful provider result, never the result itself. */
+  result_fingerprint?: string;
   approval_id?: string;
   note?: string;
   /** Timestamp override for deterministic tests. Defaults to now. */
@@ -266,6 +268,21 @@ export class Ledger {
    * caveat documented in the file header).
    */
   historyForAgent(agentPubkey: string, currency: string, now: Date): AgentHistory {
+    return aggregateHistory(
+      this.verifiedSnapshot("Refusing to calculate spend history from a corrupted ledger."),
+      agentPubkey,
+      currency,
+      now
+    );
+  }
+
+  /**
+   * One snapshot read that serves both the incremental verification of
+   * the delta and whatever scan the caller performs, so scans always
+   * run over bytes that passed a hash check (modulo the same-size
+   * in-place caveat documented in the file header).
+   */
+  private verifiedSnapshot(refusal: string): string[] {
     const buf = existsSync(this.filePath) ? readFileSync(this.filePath) : Buffer.alloc(0);
     const lines = splitLines(buf.toString("utf8"));
     if (buf.length !== this.verifiedBytes) {
@@ -273,14 +290,77 @@ export class Ledger {
         buf.length > this.verifiedBytes &&
         this.advanceCheckpoint(buf.subarray(this.verifiedBytes).toString("utf8"));
       if (!grewCleanly) {
-        this.adoptFullVerify(
-          lines,
-          buf.length,
-          "Refusing to calculate spend history from a corrupted ledger."
-        );
+        this.adoptFullVerify(lines, buf.length, refusal);
       }
     }
-    return aggregateHistory(lines, agentPubkey, currency, now);
+    return lines;
+  }
+
+  /**
+   * Last durable outcome for an exact direct (no-approval) gated call
+   * (external 0.5 review). Successful and ambiguous outcomes are replay
+   * barriers: an identical retry must not produce a second transfer
+   * merely because the agent missed a response. Verification of the
+   * snapshot is incremental against this instance's checkpoint, so the
+   * cost per call stays flat in hashing work.
+   */
+  latestDirectExecution(fingerprint: string): LedgerRecord | undefined {
+    const lines = this.verifiedSnapshot("Refusing to deduplicate against a corrupted ledger.");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const record = JSON.parse(lines[i]!) as LedgerRecord;
+      if (
+        record.type === "execution" &&
+        record.approval_id === undefined &&
+        record.fingerprint === fingerprint
+      ) {
+        return record;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Narrow cross-check of the mutable approval store against the
+   * hash-chained ledger, run immediately before money moves (external
+   * 0.5 review, reduced in scope): a "granted" store record with no
+   * matching approval_granted ledger record was written by something
+   * other than the approve path, so the gate refuses to execute it.
+   * This is tamper-EVIDENT, not tamper-proof: an attacker who can also
+   * append correctly-chained ledger records defeats it, exactly as the
+   * README documents for the ledger itself.
+   */
+  grantRecordProblem(approval: {
+    approval_id: string;
+    fingerprint: string;
+    agent_pubkey: string;
+  }): string | null {
+    const lines = this.verifiedSnapshot("Refusing to execute against a corrupted ledger.");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const record = JSON.parse(lines[i]!) as LedgerRecord;
+      if (record.type !== "approval_granted") continue;
+      if (record.approval_id !== approval.approval_id) continue;
+      if (record.fingerprint !== approval.fingerprint) {
+        return "the ledger grant for this approval id covers a different call fingerprint";
+      }
+      if (record.agent_pubkey !== approval.agent_pubkey) {
+        return "the ledger grant for this approval id names a different agent";
+      }
+      return null;
+    }
+    return "the approval store says granted, but the ledger has no approval_granted record";
+  }
+
+  /** All direct calls whose provider outcome still needs operator evidence. */
+  directExecutionIncidents(): LedgerRecord[] {
+    const lines = this.verifiedSnapshot("Refusing to list incidents from a corrupted ledger.");
+    const latest = new Map<string, LedgerRecord>();
+    for (const line of lines) {
+      const record = JSON.parse(line) as LedgerRecord;
+      if (record.type === "execution" && record.approval_id === undefined) {
+        latest.set(record.fingerprint, record);
+      }
+    }
+    return [...latest.values()].filter((record) => record.execution_status === "in_progress");
   }
 
   append(entry: LedgerEntryInput): LedgerRecord {
@@ -417,7 +497,11 @@ const INTEGER_AMOUNT = /^[0-9]+$/;
  *   - gated executions that succeeded (type "execution", status
  *     "executed"): in gate mode the bridge sees the actual downstream
  *     call, so it counts real movement and never double-counts the
- *     preceding allow decision (which carries a tool_name).
+ *     preceding allow decision (which carries a tool_name);
+ *   - direct (no-approval) calls whose latest state is "in_progress"
+ *     (external 0.5 review): the durable pre-execution claim, or an
+ *     ambiguous transport outcome, may already have moved money, so it
+ *     is reserved conservatively until an operator reconciles it.
  *
  * Denied, still-pending, and expired intents never moved money.
  * Aggregates are scoped to the requesting agent's pubkey and to the
@@ -464,23 +548,37 @@ function aggregateHistory(
     string,
     { final: LedgerRecord; startedTs?: string }
   >();
+  const directExecutions = new Map<
+    string,
+    { final: LedgerRecord; startedTs?: string }
+  >();
 
   for (const line of lines) {
     const record = JSON.parse(line) as LedgerRecord;
     const advisoryAllow =
       record.type === "decision" && record.decision === "allow" && record.tool_name === undefined;
-    const gatedExecution = record.type === "execution" && record.execution_status === "executed";
-    if (record.type === "execution" && record.approval_id !== undefined) {
-      const prior = approvedExecutions.get(record.approval_id);
-      approvedExecutions.set(record.approval_id, {
+    if (record.type === "execution") {
+      // Approved executions key on the approval id; direct calls key on
+      // the call fingerprint so claim, outcome, and any reconciliation
+      // records collapse to one final state per exact call.
+      const executions =
+        record.approval_id !== undefined ? approvedExecutions : directExecutions;
+      const key = record.approval_id ?? record.fingerprint;
+      const prior = executions.get(key);
+      const newAttempt =
+        record.execution_status === "in_progress" &&
+        prior !== undefined &&
+        prior.final.execution_status !== "in_progress";
+      executions.set(key, {
         final: record,
-        startedTs:
-          prior?.startedTs ??
-          (record.execution_status === "in_progress" ? record.ts : undefined)
+        startedTs: newAttempt
+          ? record.ts
+          : prior?.startedTs ??
+            (record.execution_status === "in_progress" ? record.ts : undefined)
       });
       continue;
     }
-    if (!advisoryAllow && !gatedExecution) continue;
+    if (!advisoryAllow) continue;
     countable.push({ record });
   }
   // One human approval is one possible transfer. A crash can leave an
@@ -490,6 +588,17 @@ function aggregateHistory(
   // exists, so audit recovery cannot double the rolling spend amount.
   for (const { final, startedTs } of approvedExecutions.values()) {
     if (final.execution_status === "executed") {
+      countable.push({ record: final, effectiveTs: startedTs });
+    }
+  }
+  // Direct calls additionally reserve an unresolved in_progress claim:
+  // a crash before the outcome record, or an ambiguous transport
+  // failure, may already have moved the money.
+  for (const { final, startedTs } of directExecutions.values()) {
+    if (
+      final.execution_status === "executed" ||
+      final.execution_status === "in_progress"
+    ) {
       countable.push({ record: final, effectiveTs: startedTs });
     }
   }

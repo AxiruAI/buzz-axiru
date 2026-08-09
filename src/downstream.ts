@@ -32,7 +32,9 @@ export class DownstreamError extends Error {
   constructor(
     message: string,
     /** JSON-RPC error code to surface to the agent. */
-    readonly code: number = -32000
+    readonly code: number = -32000,
+    /** Whether a sent payment request has a definitive negative outcome. */
+    readonly outcome: "failed" | "unknown" = "failed"
   ) {
     super(message);
     this.name = "DownstreamError";
@@ -109,7 +111,11 @@ export class DownstreamClient {
   }
 
   /** Spawn the child and run the MCP initialize handshake. */
-  async start(protocolVersion: string, clientVersion: string): Promise<void> {
+  async start(
+    protocolVersion: string,
+    clientVersion: string,
+    supportedProtocolVersions: readonly string[] = [protocolVersion]
+  ): Promise<void> {
     this.child = spawn(this.spec.command, this.spec.args, {
       env: childEnv(this.spec),
       // stderr is inherited so the operator sees downstream logs.
@@ -137,6 +143,15 @@ export class DownstreamClient {
     });
     if (!isRecord(init)) {
       throw new DownstreamError("downstream initialize returned a non-object result");
+    }
+    if (
+      typeof init.protocolVersion !== "string" ||
+      !supportedProtocolVersions.includes(init.protocolVersion)
+    ) {
+      throw new DownstreamError(
+        `downstream selected unsupported protocol version ${JSON.stringify(init.protocolVersion)}; ` +
+          `supported versions: ${supportedProtocolVersions.join(", ")}`
+      );
     }
     this.serverInfo = isRecord(init.serverInfo) ? { ...init.serverInfo } : null;
     this.capabilities = copyToNullPrototype(init.capabilities);
@@ -189,7 +204,10 @@ export class DownstreamClient {
     this.dead = reason;
     for (const [, entry] of this.pending) {
       clearTimeout(entry.timer);
-      entry.reject(new DownstreamError(reason));
+      // These requests were written before the child disappeared. A
+      // payment provider may have accepted the side effect even though
+      // its MCP process died before relaying the response.
+      entry.reject(new DownstreamError(reason, -32000, "unknown"));
     }
     this.pending.clear();
   }
@@ -209,9 +227,15 @@ export class DownstreamClient {
     if (!entry) return;
     this.pending.delete(message.id);
     clearTimeout(entry.timer);
-    if (Object.prototype.hasOwnProperty.call(message, "error") && message.error !== null) {
+    if (message.jsonrpc !== "2.0") {
+      entry.reject(
+        new DownstreamError("downstream returned an invalid JSON-RPC version", -32000, "unknown")
+      );
+    } else if (Object.prototype.hasOwnProperty.call(message, "error") && message.error !== null) {
       if (!isRecord(message.error)) {
-        entry.reject(new DownstreamError("downstream returned an invalid JSON-RPC error"));
+        entry.reject(
+          new DownstreamError("downstream returned an invalid JSON-RPC error", -32000, "unknown")
+        );
         return;
       }
       const code = typeof message.error.code === "number" ? message.error.code : -32000;
@@ -223,7 +247,9 @@ export class DownstreamClient {
     } else if (Object.prototype.hasOwnProperty.call(message, "result")) {
       entry.resolve(message.result);
     } else {
-      entry.reject(new DownstreamError("downstream returned an invalid JSON-RPC response"));
+      entry.reject(
+        new DownstreamError("downstream returned an invalid JSON-RPC response", -32000, "unknown")
+      );
     }
   }
 
@@ -240,14 +266,28 @@ export class DownstreamClient {
         this.pending.delete(id);
         reject(
           new DownstreamError(
-            `downstream request ${method} timed out after ${this.spec.request_timeout_ms}ms`
+            `downstream request ${method} timed out after ${this.spec.request_timeout_ms}ms`,
+            -32000,
+            "unknown"
           )
         );
       }, this.spec.request_timeout_ms);
       this.pending.set(id, { resolve, reject, timer });
-      this.child!.stdin.write(
-        JSON.stringify({ jsonrpc: "2.0", id, method, ...(params !== undefined ? { params } : {}) }) + "\n"
-      );
+      try {
+        this.child!.stdin.write(
+          JSON.stringify({ jsonrpc: "2.0", id, method, ...(params !== undefined ? { params } : {}) }) + "\n"
+        );
+      } catch (err) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(
+          new DownstreamError(
+            `downstream request ${method} could not be written: ${(err as Error).message}`,
+            -32000,
+            "unknown"
+          )
+        );
+      }
     });
   }
 

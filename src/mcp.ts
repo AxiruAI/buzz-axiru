@@ -78,19 +78,26 @@ export const MAX_LINE_CHARS = 1_048_576;
  */
 export const MAX_ARGUMENT_DEPTH = 64;
 export const MAX_ARGUMENT_NODES = 20_000;
+/** Aggregate string/key budget for values retained in approvals and records. */
+export const MAX_ARGUMENT_CHARS = 262_144;
 
 /**
  * Describe why a value is too big or too deep to process, or null when
  * it is fine. Iterative on purpose: a recursive checker would hit the
- * same stack limit it exists to detect.
+ * same stack limit it exists to detect. The aggregate character budget
+ * (external 0.5 review) exists because node and depth caps alone still
+ * admitted a small object carrying megabytes of strings into parked
+ * approvals and retained results.
  */
 export function jsonShapeProblem(
   value: unknown,
   maxDepth: number = MAX_ARGUMENT_DEPTH,
-  maxNodes: number = MAX_ARGUMENT_NODES
+  maxNodes: number = MAX_ARGUMENT_NODES,
+  maxChars: number = MAX_ARGUMENT_CHARS
 ): string | null {
   const stack: Array<{ node: unknown; depth: number }> = [{ node: value, depth: 1 }];
   let nodes = 0;
+  let chars = 0;
   while (stack.length > 0) {
     const { node, depth } = stack.pop()!;
     nodes += 1;
@@ -100,12 +107,17 @@ export function jsonShapeProblem(
     if (depth > maxDepth) {
       return `arguments are nested deeper than ${maxDepth} levels`;
     }
+    if (typeof node === "string") chars += node.length;
     if (Array.isArray(node)) {
       for (const child of node) stack.push({ node: child, depth: depth + 1 });
     } else if (typeof node === "object" && node !== null) {
-      for (const child of Object.values(node as Record<string, unknown>)) {
+      for (const [key, child] of Object.entries(node as Record<string, unknown>)) {
+        chars += key.length;
         stack.push({ node: child, depth: depth + 1 });
       }
+    }
+    if (chars > maxChars) {
+      return `arguments contain more than ${maxChars} string characters`;
     }
   }
   return null;

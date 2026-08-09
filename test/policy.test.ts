@@ -8,6 +8,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import { gatedCallFingerprint } from "../src/approvals.js";
 import { AGENT_PUBKEY, NOON_UTC, makeBridge, seedAllow } from "./helpers.js";
 
 const HOUR = 60 * 60 * 1000;
@@ -161,16 +162,17 @@ test("a payment may land exactly on the daily cap", async () => {
 test("an ambiguous in-progress payment reserves daily-cap headroom", () => {
   const { bridge } = makeBridge();
   seedAllow(bridge, "50000", new Date(NOON_UTC.getTime() - HOUR));
+  const parkedArgs = { amount: "8950000" };
   const approval = bridge.approvals.createOrGet(
     {
-      fingerprint: "sha256:" + "5b".repeat(32),
+      fingerprint: gatedCallFingerprint("create_payment", parkedArgs, AGENT_PUBKEY),
       agent_pubkey: AGENT_PUBKEY,
       amount_minor_units: "8950000",
       currency: "USD",
       counterparty: "acme-datacenter.example",
       memo: "ambiguous provider response",
       reason_code: "guardrails.pending.above_approval_threshold",
-      call: { tool_name: "create_payment", arguments: { amount: "8950000" } }
+      call: { tool_name: "create_payment", arguments: parkedArgs }
     },
     NOON_UTC
   );

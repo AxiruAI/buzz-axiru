@@ -34,11 +34,21 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync } from "node:fs";
+import {
+  closeSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync
+} from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
 
 export const LOCK_FILE_NAME = ".lock";
+/** Held for the full lifetime of an enforcing gate, not just one write. */
+export const SERVE_LOCK_FILE_NAME = ".serve.lock";
 
 /** How long to wait for a contended lock before giving up loudly. */
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -100,48 +110,112 @@ function isStale(owner: LockOwner | null, now: number): boolean {
   return now - owner.at > STALE_AFTER_MS;
 }
 
+/** Create and durably identify one lock owner using O_CREAT|O_EXCL. */
+function createOwnerFile(lockPath: string): LockOwner {
+  const fd = openSync(lockPath, "wx", 0o600);
+  const owner: LockOwner = {
+    pid: process.pid,
+    host: hostname(),
+    at: Date.now(),
+    token: randomUUID()
+  };
+  let complete = false;
+  try {
+    writeFileSync(fd, JSON.stringify(owner), "utf8");
+    fsyncSync(fd);
+    complete = true;
+  } finally {
+    closeSync(fd);
+    if (!complete) {
+      // We created this path and never published a complete owner. No
+      // conforming contender can have replaced it while it still exists.
+      try {
+        unlinkSync(lockPath);
+      } catch {
+        // Preserve the original write/fsync error.
+      }
+    }
+  }
+  return owner;
+}
+
+/**
+ * Remove a stale owner's lock while holding a separate O_EXCL recovery
+ * token (external 0.5 review). Serializing reclamation matters: without
+ * it, two restarting processes can both classify the old owner as dead,
+ * and the slower one then unlinks the FASTER process's newly created
+ * lock, leaving two live writers inside one critical section. The owner
+ * is re-read under the recovery token before the unlink.
+ */
+function tryReclaim(lockPath: string): boolean {
+  const recoveryPath = `${lockPath}.reclaim`;
+  let recoveryOwner: LockOwner;
+  try {
+    recoveryOwner = createOwnerFile(recoveryPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw err;
+  }
+  try {
+    const current = readOwner(lockPath);
+    if (!isStale(current, Date.now())) return false;
+    try {
+      unlinkSync(lockPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+    return true;
+  } finally {
+    release(recoveryPath, recoveryOwner);
+  }
+}
+
 /** Acquire the lock, blocking until it is ours or the timeout expires. */
-function acquire(lockPath: string, timeoutMs: number): LockOwner {
+function acquire(lockPath: string, timeoutMs: number, longLived = false): LockOwner {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
       // "wx" is O_CREAT|O_EXCL: exactly one racer creates the file.
-      const fd = openSync(lockPath, "wx", 0o600);
-      const owner: LockOwner = {
-        pid: process.pid,
-        host: hostname(),
-        at: Date.now(),
-        token: randomUUID()
-      };
-      try {
-        writeSync(fd, JSON.stringify(owner));
-      } finally {
-        closeSync(fd);
-      }
-      return owner;
+      return createOwnerFile(lockPath);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
     }
     const owner = readOwner(lockPath);
-    if (isStale(owner, Date.now())) {
-      try {
-        unlinkSync(lockPath);
-      } catch {
-        // Another waiter reclaimed it first; that is the same outcome.
-      }
-      continue;
-    }
+    if (isStale(owner, Date.now()) && tryReclaim(lockPath)) continue;
     if (Date.now() >= deadline) {
       const who =
         owner !== null ? `pid ${owner.pid} on ${owner.host || "an unknown host"}` : "an unknown process";
       throw new Error(
-        `buzz-axiru: could not lock the data directory after ${timeoutMs}ms: ${lockPath} is held by ${who}. ` +
-          "Refusing to write the ledger or the approval store unlocked, because concurrent writers corrupt " +
-          "the hash chain. Stop the other buzz-axiru process, or delete the lock file if you are certain it is stale."
+        longLived
+          ? `buzz-axiru: another enforcing gate already owns this data directory (${lockPath} is held by ${who}). ` +
+              "Two gates sharing one cap history can each authorize payments from a stale snapshot. Stop the " +
+              "other gate or use a distinct --data-dir; delete the serving lock only after verifying its owner is gone."
+          : `buzz-axiru: could not lock the data directory after ${timeoutMs}ms: ${lockPath} is held by ${who}. ` +
+              "Refusing to write the ledger or the approval store unlocked, because concurrent writers corrupt " +
+              "the hash chain. Stop the other buzz-axiru process, or delete the lock file if you are certain it is stale."
       );
     }
     sleepSync(RETRY_MS);
   }
+}
+
+/**
+ * Claim exclusive ownership of one enforcing data directory for the
+ * lifetime of a gate (external 0.5 review). The short critical-section
+ * lock protects file integrity; this lease additionally guarantees at
+ * most one gate serves a given cap history, so two gates cannot both
+ * authorize against snapshots each is about to invalidate.
+ */
+export function acquireServingLease(dataDir: string): () => void {
+  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  const lockPath = join(dataDir, SERVE_LOCK_FILE_NAME);
+  const owner = acquire(lockPath, 0, true);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    release(lockPath, owner);
+  };
 }
 
 function release(lockPath: string, owner: LockOwner): void {

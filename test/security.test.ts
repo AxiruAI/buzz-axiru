@@ -18,6 +18,7 @@ import {
   ApprovalQueueFullError,
   ApprovalStore,
   approvalIdForFingerprint,
+  gatedCallFingerprint,
   legacyApprovalIdForFingerprint
 } from "../src/approvals.js";
 import { getPath, extractPayment, loadConfig, matchesPattern } from "../src/config.js";
@@ -358,15 +359,16 @@ test("legacy short-id compatibility never merges a colliding fingerprint", () =>
 test("a durable execution claim has exactly one winner across store instances", () => {
   const dir = newDir();
   const store = new ApprovalStore(dir);
+  const parkedArgs = { amount: "5000" };
   const approval = store.createOrGet({
-    fingerprint: "sha256:" + "7e".repeat(32),
+    fingerprint: gatedCallFingerprint("create_payment", parkedArgs, AGENT_PUBKEY),
     agent_pubkey: AGENT_PUBKEY,
     amount_minor_units: "5000",
     currency: "USD",
     counterparty: "cloudsmith.example",
     memo: "memo-must-not-leak",
     reason_code: "bridge.pending.ceiling",
-    call: { tool_name: "create_payment", arguments: { amount: "5000" } }
+    call: { tool_name: "create_payment", arguments: parkedArgs }
   });
   store.decide(approval.approval_id, "granted", "tester", undefined, NOON_UTC);
 

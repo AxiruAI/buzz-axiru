@@ -89,6 +89,31 @@ async function makeGate(
   };
 }
 
+/**
+ * Grant an approval the way the CLI does: the approval_granted ledger
+ * record is written BEFORE the store decision. The gate cross-checks
+ * the store against the ledger before executing a grant, so a bare
+ * store.decide() is (correctly) refused at execution time.
+ */
+function grantLikeCli(ctx: GateContext, approvalId: string, by = "tester"): void {
+  const current = ctx.bridge.approvals.get(approvalId)!;
+  ctx.bridge.ledger.append({
+    type: "approval_granted",
+    actor: by,
+    agent_pubkey: current.agent_pubkey,
+    reason_code: "bridge.approval.granted",
+    amount_minor_units: current.amount_minor_units,
+    currency: current.currency,
+    counterparty: current.counterparty,
+    memo: current.memo,
+    fingerprint: current.fingerprint,
+    approval_id: current.approval_id,
+    ...(current.call !== undefined ? { tool_name: current.call.tool_name } : {}),
+    ts: ctx.now.value.toISOString()
+  });
+  ctx.bridge.approvals.decide(approvalId, "granted", by, undefined, ctx.now.value);
+}
+
 let nextId = 100;
 async function callTool(
   gate: GateServer,
@@ -187,7 +212,12 @@ test("allow path executes the call downstream and records decision plus executio
     assert.ok(decision);
     assert.equal(decision!.decision, "allow");
     assert.equal(decision!.agent_pubkey, AGENT_PUBKEY);
-    const execution = records.find((r) => r.type === "execution");
+    // The durable claim precedes the downstream call; the final record
+    // settles it as executed.
+    const executions = records.filter((r) => r.type === "execution");
+    assert.equal(executions[0]!.execution_status, "in_progress");
+    assert.equal(executions[0]!.reason_code, "bridge.execution.started");
+    const execution = executions.at(-1);
     assert.ok(execution);
     assert.equal(execution!.execution_status, "executed");
   } finally {
@@ -237,7 +267,7 @@ test("require_approval parks the call, executes it once on approve, and replays 
     assert.equal(downstreamCalls(ctx.logPath).length, 0);
 
     // Human approves (what the CLI does), then the sweeper replays it.
-    ctx.bridge.approvals.decide(approvalId, "granted", "tester", undefined, ctx.now.value);
+    grantLikeCli(ctx, approvalId);
     await ctx.gate.processApprovals();
     const calls = downstreamCalls(ctx.logPath);
     assert.equal(calls.length, 1, "approved call executes exactly once");
@@ -482,7 +512,7 @@ test("the hash chain covers gated decisions, executions, approvals, and expiries
     await callTool(ctx.gate, "create_payment", { ...PAYMENT, destination: "evil-corp.example" }); // deny
     const parked = await callTool(ctx.gate, "create_payment", { ...PAYMENT, amount: 4000000 });
     const approvalId = String(toolText(parked.result!).approval_id);
-    ctx.bridge.approvals.decide(approvalId, "granted", "tester", undefined, ctx.now.value);
+    grantLikeCli(ctx, approvalId);
     await ctx.gate.processApprovals(); // execution after approval
 
     const records = ledgerRecords(ctx.ledgerPath);
@@ -523,11 +553,14 @@ test("approved execution counts toward the agent's rolling daily cap", async () 
   }
 });
 
-test("execution failure after approval is recorded with a distinct status", async () => {
+test("a downstream crash mid-call after approval is an UNKNOWN outcome, not a failure", async () => {
   const ctx = await makeGate((doc) => {
     // Gate crash_now and map a fake amount so policy can evaluate it;
-    // replaying it after approval kills the downstream server, which
-    // is exactly the failure we want recorded.
+    // replaying it after approval kills the downstream server mid-call.
+    // The child exits without replying, so the gate cannot know whether
+    // money moved (external 0.5 review): the claim must stay
+    // in_progress and demand reconciliation instead of being recorded
+    // as a definitive, human-reassuring "failed".
     (doc.payment_tools as Record<string, unknown>) = {
       gate: ["create_payment", "crash_now"],
       mappings: {
@@ -544,27 +577,31 @@ test("execution failure after approval is recorded with a distinct status", asyn
     seedAllow(ctx.bridge, "50000", new Date(NOON_UTC.getTime() - HOUR));
     const parked = await callTool(ctx.gate, "crash_now", { amount: 4000000 });
     const approvalId = String(toolText(parked.result!).approval_id);
-    ctx.bridge.approvals.decide(approvalId, "granted", "tester", undefined, ctx.now.value);
+    grantLikeCli(ctx, approvalId);
     await ctx.gate.processApprovals();
 
     const approval = ctx.bridge.approvals.get(approvalId)!;
-    assert.equal(approval.execution_status, "failed");
+    assert.equal(approval.execution_status, "in_progress", "ambiguous outcome stays claimed");
+    assert.ok(approval.execution_error, "the transport evidence is attached");
     const records = ledgerRecords(ctx.ledgerPath);
     const started = records.find(
-      (r) => r.type === "execution" && r.execution_status === "in_progress"
+      (r) => r.type === "execution" && r.reason_code === "bridge.execution.started"
     );
     assert.ok(started, "durable execution claim is audited before the call");
-    const failed = records.find(
-      (r) => r.type === "execution" && r.execution_status === "failed"
+    const unknown = records.find(
+      (r) => r.type === "execution" && r.reason_code === "bridge.execution.outcome_unknown"
     );
-    assert.ok(failed);
-    assert.equal(failed!.execution_status, "failed");
-    assert.equal(failed!.reason_code, "bridge.execution.failed");
+    assert.ok(unknown, "the lost outcome is recorded as unknown, not failed");
+    assert.ok(
+      !records.some((r) => r.type === "execution" && r.execution_status === "failed"),
+      "a lost response is never recorded as a definitive failure"
+    );
 
-    // The agent's follow-up sees the failure, and the grant is spent.
+    // The agent's follow-up is held for reconciliation, never retried.
     const after = await callTool(ctx.gate, "crash_now", { amount: 4000000 });
     const body = toolText(after.result!);
-    assert.equal(body.status, "execution_failed_after_approval");
+    assert.equal(body.reason_code, "bridge.execution.reconciliation_required");
+    assert.equal(body.executed, "unknown");
     assert.equal(verifyLedger(ctx.ledgerPath).ok, true);
   } finally {
     ctx.close();

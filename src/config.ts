@@ -318,6 +318,7 @@ function parseDownstreamEntry(raw: unknown, path: string, label: string): Downst
         "replace it with an exact downstream package version you reviewed"
     );
   }
+  validateNpxAutoInstall(d.command, args as string[], path, label);
   const env = Object.create(null) as Record<string, string>;
   if (d.env !== undefined && d.env !== null) {
     if (typeof d.env !== "object" || Array.isArray(d.env)) {
@@ -503,12 +504,45 @@ function parseMaxPending(raw: unknown, path: string): number | null {
 
 function parseAgentPubkey(raw: unknown, path: string): string | null {
   if (raw === undefined || raw === null) return null;
-  if (typeof raw !== "string" || !isPlausiblePubkey(raw)) {
+  const normalized = typeof raw === "string" ? normalizePubkey(raw) : null;
+  if (normalized === null) {
     throw new Error(
-      `buzz-axiru: ${path}: agent_pubkey must be a Nostr pubkey (64-char lowercase hex or npub form)`
+      `buzz-axiru: ${path}: agent_pubkey must be a Nostr pubkey ` +
+        "(64-char lowercase hex or checksummed npub form)"
     );
   }
-  return raw;
+  return normalized;
+}
+
+/**
+ * Refuse unpinned npx downstream commands (external 0.5 review). An
+ * `npx` payment server without `-y package@exact-version` re-resolves
+ * on every gate start, so the binary that moves money can silently
+ * change under the operator between reviews; a missing -y can also
+ * hang an MCP stdio stream on an interactive install prompt. Only the
+ * auditable canonical shape `npx -y package@1.2.3 ...` is accepted;
+ * inferring npx's larger option grammar would create bypasses (an
+ * option value mistaken for the package, an unpinned later target).
+ */
+function validateNpxAutoInstall(command: string, args: string[], path: string, label: string): void {
+  const executable = basename(command).toLowerCase().replace(/\.cmd$/, "");
+  if (executable !== "npx") return;
+  const yesIndex = args.findIndex((arg) => arg === "-y" || arg === "--yes");
+  const spec = args[yesIndex + 1];
+  if (yesIndex !== 0 || spec === undefined || spec.startsWith("-")) {
+    throw new Error(
+      `buzz-axiru: ${path}: ${label} must use the auditable form ` +
+        "npx -y <package@exact-version> followed by package arguments"
+    );
+  }
+  const exact =
+    /^(?:@[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._-]*|[a-z0-9][a-z0-9._-]*)@\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+  if (!exact.test(spec)) {
+    throw new Error(
+      `buzz-axiru: ${path}: ${label} auto-installs ${JSON.stringify(spec)} with npx -y. ` +
+        "Pin an exact reviewed version such as @scope/package@1.2.3; tags and ranges are refused."
+    );
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -517,22 +551,39 @@ function parseAgentPubkey(raw: unknown, path: string): string | null {
 
 /**
  * Glob match where "*" is the only wildcard (matches any run, including
- * empty).
+ * empty). The wildcard matches newlines too: a downstream server that
+ * named a tool "pay_a\nb" must not slip past a "pay_*" gate pattern
+ * while still being callable by that exact name.
  *
- * The wildcard compiles to `[\s\S]*`, not `.*`. `.` does not match a
- * newline, so a downstream server that named a tool "pay_a\nb" would
- * slip past a "pay_*" gate pattern while still being callable by that
- * exact name: the gate would treat a money tool as pass-through. The
- * class form makes the wildcard mean what an operator reads it to mean.
- * (Anchoring is already correct: JavaScript `$` without the `m` flag
- * matches only at end of input, not before a trailing newline.)
+ * Implemented without regular expressions (external 0.5 review): the
+ * name being matched comes from the downstream server, and a compiled
+ * pattern with several wildcards can be driven into catastrophic
+ * backtracking by an adversarial tool name. This form is a standard
+ * two-pointer glob match, linear-ish and allocation-free.
  */
 export function matchesPattern(pattern: string, name: string): boolean {
-  const escaped = pattern
-    .split("*")
-    .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-    .join("[\\s\\S]*");
-  return new RegExp(`^(?:${escaped})$`).test(name);
+  let p = 0;
+  let n = 0;
+  let starP = -1;
+  let starN = 0;
+  while (n < name.length) {
+    if (p < pattern.length && (pattern[p] === name[n]) && pattern[p] !== "*") {
+      p += 1;
+      n += 1;
+    } else if (p < pattern.length && pattern[p] === "*") {
+      starP = p;
+      starN = n;
+      p += 1;
+    } else if (starP !== -1) {
+      p = starP + 1;
+      starN += 1;
+      n = starN;
+    } else {
+      return false;
+    }
+  }
+  while (p < pattern.length && pattern[p] === "*") p += 1;
+  return p === pattern.length;
 }
 
 /**
@@ -550,14 +601,28 @@ export function isGatedTool(config: BridgeConfig, toolName: string): boolean {
   return config.payment_tools.gate.some((pattern) => matchesPattern(pattern, toolName));
 }
 
-/** Find the amount mapping for a tool: exact key first, then glob keys. */
+/**
+ * Find the amount mapping for a tool: an exact key wins, then a SINGLE
+ * matching glob key. Two overlapping wildcard mappings for one tool
+ * made extraction depend on object key order (external 0.5 review), so
+ * that case now returns null and the call fails closed to a human
+ * instead of reading the amount from whichever mapping happened to
+ * come first.
+ */
 export function mappingForTool(config: BridgeConfig, toolName: string): ToolMapping | null {
   const mappings = config.payment_tools?.mappings ?? {};
   if (Object.prototype.hasOwnProperty.call(mappings, toolName)) return mappings[toolName]!;
-  for (const [key, mapping] of Object.entries(mappings)) {
-    if (key.includes("*") && matchesPattern(key, toolName)) return mapping;
-  }
-  return null;
+  const matches = mappingPatternsForTool(config, toolName);
+  return matches.length === 1 ? mappings[matches[0]!]! : null;
+}
+
+/** Matching mapping keys for a tool: the exact key, or all matching globs. */
+export function mappingPatternsForTool(config: BridgeConfig, toolName: string): string[] {
+  const mappings = config.payment_tools?.mappings ?? {};
+  if (Object.prototype.hasOwnProperty.call(mappings, toolName)) return [toolName];
+  return Object.keys(mappings).filter(
+    (key) => key.includes("*") && matchesPattern(key, toolName)
+  );
 }
 
 /**
@@ -587,6 +652,11 @@ export type ExtractionResult =
 
 const INTEGER_STRING = /^[0-9]+$/;
 
+const CONTROL_CHAR_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+
+/** 2^256-1 is 78 decimal digits; larger payment amounts are never useful here. */
+export const MAX_MINOR_UNIT_DIGITS = 78;
+
 /**
  * Read amount, currency, and counterparty out of a gated tool call's
  * arguments. Every unreadable case FAILS CLOSED: the caller must route
@@ -612,7 +682,11 @@ export function extractPayment(
   let amount: string | null = null;
   if (typeof rawAmount === "number" && Number.isSafeInteger(rawAmount) && rawAmount >= 0) {
     amount = String(rawAmount);
-  } else if (typeof rawAmount === "string" && INTEGER_STRING.test(rawAmount)) {
+  } else if (
+    typeof rawAmount === "string" &&
+    INTEGER_STRING.test(rawAmount) &&
+    rawAmount.length <= MAX_MINOR_UNIT_DIGITS
+  ) {
     amount = rawAmount;
   }
   if (amount === null) {
@@ -620,8 +694,8 @@ export function extractPayment(
       ok: false,
       reason_code: "bridge.pending.amount_unextractable",
       detail:
-        `could not read a non-negative integer amount from "${mapping.amount_field}" ` +
-        `in the arguments of "${toolName}"`
+        `could not read a bounded non-negative integer amount from "${mapping.amount_field}" ` +
+        `in the arguments of "${toolName}" (at most ${MAX_MINOR_UNIT_DIGITS} digits)`
     };
   }
 
@@ -635,9 +709,16 @@ export function extractPayment(
         detail: `could not read a currency from "${mapping.currency_field}" in the arguments of "${toolName}"`
       };
     }
-    currency = rawCurrency.toUpperCase();
+    currency = rawCurrency.trim().toUpperCase();
   } else {
     currency = (mapping.currency ?? config.currency).toUpperCase();
+  }
+  if (!/^[A-Z0-9._-]{2,20}$/.test(currency)) {
+    return {
+      ok: false,
+      reason_code: "bridge.pending.currency_unextractable",
+      detail: `currency for "${toolName}" is not a plausible 2-20 character currency or token symbol`
+    };
   }
 
   let counterparty: string;
@@ -650,9 +731,16 @@ export function extractPayment(
         detail: `could not read a counterparty from "${mapping.counterparty_field}" in the arguments of "${toolName}"`
       };
     }
-    counterparty = rawCounterparty;
+    counterparty = rawCounterparty.trim();
   } else {
     counterparty = mapping.counterparty ?? `tool:${toolName}`;
+  }
+  if (counterparty.length > 512 || CONTROL_CHAR_RE.test(counterparty)) {
+    return {
+      ok: false,
+      reason_code: "bridge.pending.counterparty_unextractable",
+      detail: `counterparty for "${toolName}" must be at most 512 printable characters`
+    };
   }
 
   return { ok: true, amount_minor_units: amount, currency, counterparty };
@@ -762,13 +850,83 @@ export function policiesForAgent(
 /**
  * VERIFIED (block/buzz docs): buzz-acp allowlists identify authors as
  * "64-char hex pubkeys", and agent keys are minted as nsec/npub Nostr
- * keypairs. The bridge accepts either form but treats the string as an
- * opaque identity: policies and ledger records key on the exact string.
- * Use the hex form everywhere for consistency.
+ * keypairs. The bridge accepts either form and canonicalizes it to the
+ * same 32-byte lowercase hex identity before policy or ledger use.
  */
 export const HEX_PUBKEY = /^[0-9a-f]{64}$/;
-export const NPUB = /^npub1[02-9ac-hj-np-z]{6,}$/;
+
+const BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+
+/**
+ * Convert a NIP-19 display-form npub to the canonical 32-byte hex key
+ * (external 0.5 review). NIP-19 recommends storing keys as hex and
+ * accepting npub only at input boundaries. Before this, the hex and
+ * npub spellings of ONE key were two different identity strings, so an
+ * agent could split its per-agent daily cap across the two spellings
+ * and spend up to twice its cap. The bech32 checksum is verified, so a
+ * mistyped npub is rejected instead of becoming a fresh identity.
+ *
+ * Returns canonical lowercase hex, or null when the value is neither a
+ * 64-char hex key nor a checksum-valid npub. No curve membership check
+ * on purpose: the key is an identity label here, not signature input,
+ * and the documented all-zeros unattributed fallback must stay valid.
+ */
+export function normalizePubkey(value: string): string | null {
+  if (HEX_PUBKEY.test(value)) return value;
+  if (value.length !== 63 || value !== value.toLowerCase() || !value.startsWith("npub1")) {
+    return null;
+  }
+  const words: number[] = [];
+  for (const char of value.slice(5)) {
+    const word = BECH32_CHARSET.indexOf(char);
+    if (word < 0) return null;
+    words.push(word);
+  }
+  if (words.length < 7 || bech32Polymod([...bech32HrpExpand("npub"), ...words]) !== 1) {
+    return null;
+  }
+  const bytes = convertBits(words.slice(0, -6), 5, 8);
+  if (bytes === null || bytes.length !== 32) return null;
+  return Buffer.from(bytes).toString("hex");
+}
 
 export function isPlausiblePubkey(value: string): boolean {
-  return HEX_PUBKEY.test(value) || NPUB.test(value);
+  return normalizePubkey(value) !== null;
+}
+
+function bech32HrpExpand(hrp: string): number[] {
+  const high = [...hrp].map((char) => char.charCodeAt(0) >> 5);
+  const low = [...hrp].map((char) => char.charCodeAt(0) & 31);
+  return [...high, 0, ...low];
+}
+
+function bech32Polymod(values: number[]): number {
+  const generators = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+  let checksum = 1;
+  for (const value of values) {
+    const top = checksum >>> 25;
+    checksum = ((checksum & 0x1ffffff) << 5) ^ value;
+    for (let i = 0; i < generators.length; i++) {
+      if (((top >>> i) & 1) !== 0) checksum ^= generators[i]!;
+    }
+  }
+  return checksum >>> 0;
+}
+
+function convertBits(words: number[], from: number, to: number): number[] | null {
+  let accumulator = 0;
+  let bits = 0;
+  const result: number[] = [];
+  const maxValue = (1 << to) - 1;
+  for (const word of words) {
+    if (word < 0 || word >= 1 << from) return null;
+    accumulator = (accumulator << from) | word;
+    bits += from;
+    while (bits >= to) {
+      bits -= to;
+      result.push((accumulator >>> bits) & maxValue);
+    }
+  }
+  if (bits >= from || ((accumulator << (to - bits)) & maxValue) !== 0) return null;
+  return result;
 }

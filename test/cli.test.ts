@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { ApprovalStore } from "../src/approvals.js";
+import { ApprovalStore, gatedCallFingerprint } from "../src/approvals.js";
 import { Ledger, verifyLedger } from "../src/ledger.js";
 import { AGENT_PUBKEY, NOON_UTC, TEST_POLICY_DOC } from "./helpers.js";
 
@@ -52,16 +52,17 @@ test("unknown-amount approvals require inspection acknowledgement", () => {
   const dataDir = join(dir, "data");
   writeFileSync(policies, JSON.stringify(TEST_POLICY_DOC));
   const store = new ApprovalStore(dataDir);
+  const parkedArgs = { opaque: "provider-specific" };
   const approval = store.createOrGet(
     {
-      fingerprint: "sha256:" + "4a".repeat(32),
+      fingerprint: gatedCallFingerprint("opaque_payment", parkedArgs, AGENT_PUBKEY),
       agent_pubkey: AGENT_PUBKEY,
       amount_minor_units: "unknown",
       currency: "USD",
       counterparty: "tool:opaque_payment",
       memo: "amount could not be extracted",
       reason_code: "bridge.pending.amount_unextractable",
-      call: { tool_name: "opaque_payment", arguments: { opaque: "provider-specific" } }
+      call: { tool_name: "opaque_payment", arguments: parkedArgs }
     },
     NOON_UTC
   );
@@ -101,16 +102,17 @@ test("an in-progress approval has an auditable reconciliation path", () => {
   const dataDir = join(dir, "data");
   writeFileSync(policies, JSON.stringify(TEST_POLICY_DOC));
   const store = new ApprovalStore(dataDir);
+  const parkedArgs = { amount: "5000" };
   const approval = store.createOrGet(
     {
-      fingerprint: "sha256:" + "6c".repeat(32),
+      fingerprint: gatedCallFingerprint("create_payment", parkedArgs, AGENT_PUBKEY),
       agent_pubkey: AGENT_PUBKEY,
       amount_minor_units: "5000",
       currency: "USD",
       counterparty: "cloudsmith.example",
       memo: "provider status checked",
       reason_code: "bridge.pending.ceiling",
-      call: { tool_name: "create_payment", arguments: { amount: "5000" } }
+      call: { tool_name: "create_payment", arguments: parkedArgs }
     },
     NOON_UTC
   );

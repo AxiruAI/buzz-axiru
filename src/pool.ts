@@ -116,9 +116,15 @@ export class DownstreamPool {
    * pool is worse than none, because the agent would be told about
    * tools that cannot be called.
    */
-  async start(protocolVersion: string, clientVersion: string): Promise<void> {
+  async start(
+    protocolVersion: string,
+    clientVersion: string,
+    supportedProtocolVersions: readonly string[] = [protocolVersion]
+  ): Promise<void> {
     const results = await Promise.allSettled(
-      this.members.map((m) => m.client.start(protocolVersion, clientVersion))
+      this.members.map((m) =>
+        m.client.start(protocolVersion, clientVersion, supportedProtocolVersions)
+      )
     );
     const failures = results
       .map((r, index) => ({ r, member: this.members[index]! }))

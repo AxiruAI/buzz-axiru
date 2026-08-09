@@ -48,7 +48,7 @@ import {
 } from "./quickstart.js";
 import { STARTER_POLICIES } from "./scaffold.js";
 
-const VERSION = "0.4.1";
+const VERSION = "0.5.0";
 
 interface ParsedArgs {
   command: string;
@@ -355,7 +355,8 @@ async function main(): Promise<void> {
         "  buzz-axiru show <id>         inspect one approval and its exact parked call",
         "  buzz-axiru approve <id>      grant a pending approval",
         "  buzz-axiru deny <id>         deny a pending approval",
-        "  buzz-axiru reconcile <id>    record an ambiguous execution as executed or failed",
+        "  buzz-axiru reconcile <id|fingerprint>  record an ambiguous execution as executed",
+        "                               or failed (approval id, or sha256:<hex> for a direct call)",
         "  buzz-axiru verify            re-derive the decision ledger hash chain",
         "",
         "Flags: --mode gate|advisory  --policies <path>  --data-dir <path>",
@@ -447,11 +448,15 @@ async function main(): Promise<void> {
       const unreconciled = bridge.approvals
         .all()
         .filter((a) => a.status === "granted" && a.execution_status === "in_progress");
+      // Direct (policy-allowed) calls have no approval record; their
+      // durable claim lives in the ledger, and an unresolved claim is
+      // an incident the operator must clear with reconcile.
+      const directIncidents = bridge.ledger.directExecutionIncidents();
       if (flags.json === "true") {
         process.stdout.write(JSON.stringify(pending, null, 2) + "\n");
         return;
       }
-      if (pending.length === 0 && unreconciled.length === 0) {
+      if (pending.length === 0 && unreconciled.length === 0 && directIncidents.length === 0) {
         process.stdout.write("No approvals are waiting.\n");
         return;
       }
@@ -490,6 +495,28 @@ async function main(): Promise<void> {
           );
         }
       }
+      if (directIncidents.length > 0) {
+        process.stdout.write(
+          `${directIncidents.length} direct call${directIncidents.length === 1 ? "" : "s"} ` +
+            "NEED MANUAL RECONCILIATION (policy-allowed, durably claimed, but the downstream " +
+            "outcome was lost; the amount is reserved against the cap and an identical retry " +
+            "is suppressed):\n\n"
+        );
+        for (const incident of directIncidents) {
+          process.stdout.write(
+            [
+              `${incident.fingerprint}`,
+              `  amount:       ${formatAmount(incident.amount_minor_units, incident.currency)}`,
+              `  counterparty: ${incident.counterparty}`,
+              `  tool:         ${incident.tool_name ?? "unknown"}`,
+              `  claimed:      ${incident.ts}`,
+              ...(incident.error !== undefined ? [`  evidence:     ${incident.error}`] : []),
+              `  resolve:      buzz-axiru reconcile ${incident.fingerprint} --outcome executed|failed --note <evidence>`,
+              ""
+            ].join("\n")
+          );
+        }
+      }
       return;
     }
     case "show": {
@@ -517,7 +544,13 @@ async function main(): Promise<void> {
           `  tool:         ${approval.call?.tool_name ?? "advisory request"}`,
           "",
           ...(approval.call !== undefined
-            ? ["Exact parked arguments:", JSON.stringify(approval.call.arguments, null, 2), ""]
+            ? approval.call_arguments_redacted === true
+              ? [
+                  "Exact parked arguments: removed after the final outcome (secret-retention " +
+                    "minimization); the ledger retains the call fingerprint.",
+                  ""
+                ]
+              : ["Exact parked arguments:", JSON.stringify(approval.call.arguments, null, 2), ""]
             : []),
           ...(approval.amount_minor_units === "unknown"
             ? [
@@ -535,9 +568,16 @@ async function main(): Promise<void> {
     }
     case "reconcile": {
       const id = positional[0];
-      if (!id) fail("buzz-axiru reconcile: missing approval id (see: buzz-axiru pending)");
-      if (!/^(?:[0-9a-f]{12}|[0-9a-f]{32})$/.test(id)) {
-        fail("buzz-axiru reconcile: approval id must be 12 or 32 lowercase hex characters");
+      if (!id) {
+        fail(
+          "buzz-axiru reconcile: missing approval id or direct-call fingerprint (see: buzz-axiru pending)"
+        );
+      }
+      const isDirectFingerprint = /^(?:sha256:)?[0-9a-f]{64}$/.test(id);
+      if (!isDirectFingerprint && !/^(?:[0-9a-f]{12}|[0-9a-f]{32})$/.test(id)) {
+        fail(
+          "buzz-axiru reconcile: expected a 12/32 hex approval id or a sha256:<64-hex> direct-call fingerprint"
+        );
       }
       const finalStatus = flags.outcome;
       if (finalStatus !== "executed" && finalStatus !== "failed") {
@@ -558,6 +598,55 @@ async function main(): Promise<void> {
         );
       }
       const now = new Date();
+      if (isDirectFingerprint) {
+        // A direct (policy-allowed) call with a lost outcome. The final
+        // execution record clears the conservative cap reservation
+        // (failed) or converts it to recorded spend and a permanent
+        // duplicate barrier (executed). No approval store is involved.
+        const fingerprint = id.startsWith("sha256:") ? id : `sha256:${id}`;
+        const record = withDataDirLock(config.data_dir, () => {
+          const incident = bridge.ledger.latestDirectExecution(fingerprint);
+          if (incident === undefined || incident.execution_status !== "in_progress") {
+            throw new Error(
+              `buzz-axiru: no direct call with fingerprint ${fingerprint} is awaiting reconciliation ` +
+                "(see: buzz-axiru pending)"
+            );
+          }
+          return bridge.ledger.append({
+            type: "execution",
+            actor: decidedBy,
+            agent_pubkey: incident.agent_pubkey,
+            reason_code:
+              finalStatus === "executed"
+                ? "bridge.execution.reconciled_executed"
+                : "bridge.execution.reconciled_failed",
+            amount_minor_units: incident.amount_minor_units,
+            currency: incident.currency,
+            counterparty: incident.counterparty,
+            memo: incident.memo,
+            fingerprint,
+            ...(incident.tool_name !== undefined ? { tool_name: incident.tool_name } : {}),
+            execution_status: finalStatus,
+            ...(finalStatus === "failed" ? { error: note } : {}),
+            note,
+            ts: now.toISOString()
+          });
+        });
+        process.stdout.write(
+          JSON.stringify(
+            {
+              fingerprint,
+              execution_status: finalStatus,
+              reconciled_by: decidedBy,
+              note,
+              ledger: { seq: record.seq, hash: record.hash }
+            },
+            null,
+            2
+          ) + "\n"
+        );
+        return;
+      }
       const outcome = withDataDirLock(config.data_dir, () => {
         const current = bridge.approvals.get(id);
         if (!current) throw new Error(`buzz-axiru: no approval with id ${id}`);

@@ -26,16 +26,29 @@
  * (tool name + full arguments + agent pubkey), not just the policy
  * intent fingerprint: a grant authorizes exactly the bytes the human
  * saw, and retrying an identical call after execution returns the
- * stored downstream result instead of paying twice.
+ * stored downstream result instead of paying twice. Direct policy
+ * allows are also durably claimed before the network side effect, so a
+ * gate-process crash cannot reopen an exact-call replay window.
  *
  * Licensed under the Apache License, Version 2.0.
  */
 
-import { sha256Fingerprint } from "@axiru/agent-spend-guardrails";
-
-import { ApprovalQueueFullError, isExpired, type ApprovalRequest } from "./approvals.js";
-import { extractPayment, isGatedTool, policiesForAgent, type BridgeConfig } from "./config.js";
+import {
+  ApprovalQueueFullError,
+  executionResultFingerprint,
+  gatedCallFingerprint,
+  isExpired,
+  type ApprovalRequest
+} from "./approvals.js";
+import {
+  extractPayment,
+  isGatedTool,
+  normalizePubkey,
+  policiesForAgent,
+  type BridgeConfig
+} from "./config.js";
 import { DownstreamError, type DownstreamTool } from "./downstream.js";
+import { acquireServingLease, withDataDirLock } from "./lock.js";
 import { DownstreamPool } from "./pool.js";
 import type { Bridge, SpendRequest } from "./guard.js";
 import {
@@ -79,6 +92,56 @@ function textResult(payload: Record<string, unknown>, isError: boolean): ToolCal
   };
 }
 
+/** Flatten and bound a downstream error before it enters durable records. */
+function executionErrorText(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  const flattened = raw.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, "\uFFFD");
+  return flattened.length > 1_000 ? flattened.slice(0, 997) + "..." : flattened;
+}
+
+function outcomeIsUnknown(err: unknown): boolean {
+  return err instanceof DownstreamError && err.outcome === "unknown";
+}
+
+/**
+ * A sent tool call may have moved money unless its result is safe and
+ * explicit (external 0.5 review). A non-object or unboundedly large
+ * result is treated as an UNKNOWN outcome, not a failure: the request
+ * reached the child, so the side effect may have happened. An MCP
+ * `isError: true` result is a definitive failure reported by a live
+ * downstream and stays retryable.
+ */
+function checkedToolResult(result: unknown): Record<string, unknown> {
+  if (!isJsonObject(result)) {
+    throw new DownstreamError(
+      "downstream tools/call returned a non-object result",
+      -32000,
+      "unknown"
+    );
+  }
+  const problem = jsonShapeProblem(result);
+  if (problem !== null) {
+    throw new DownstreamError(
+      `downstream tools/call returned an unsafe result shape: ${problem}`,
+      -32000,
+      "unknown"
+    );
+  }
+  if (result.isError === true) {
+    const content = Array.isArray(result.content) ? result.content : [];
+    const detail = content
+      .filter(isJsonObject)
+      .map((entry) => (typeof entry.text === "string" ? entry.text : ""))
+      .find((text) => text.trim().length > 0);
+    throw new DownstreamError(
+      detail !== undefined
+        ? `downstream tool reported failure: ${detail}`
+        : "downstream tool reported failure"
+    );
+  }
+  return result;
+}
+
 export class GateServer {
   /**
    * The downstream side, one or many servers behind a single facade.
@@ -91,6 +154,7 @@ export class GateServer {
   private readonly quiet: boolean;
   /** In-flight approval executions, to prevent a poller/retry double-execution. */
   private readonly executing = new Set<string>();
+  private releaseServingLease: (() => void) | null = null;
   readonly agentPubkey: string;
   /** True when the matcher config is missing and every tool is gated. */
   readonly gateAll: boolean;
@@ -107,8 +171,25 @@ export class GateServer {
     this.clock = options.clock ?? (() => new Date());
     this.quiet = options.quiet ?? false;
     this.gateAll = config.payment_tools === null;
-    this.agentPubkey =
-      process.env.BUZZ_AXIRU_AGENT_PUBKEY ?? config.agent_pubkey ?? UNATTRIBUTED_PUBKEY;
+    // A CONFIGURED identity must be valid and is canonicalized to hex
+    // (external 0.5 review): an npub and its hex form must not split
+    // one agent's cap history into two buckets, and a typo must not
+    // silently become a fresh identity. An absent identity keeps the
+    // documented fail-closed fallback: the all-zeros pubkey, one shared
+    // cap for every unattributed agent, and a startup warning.
+    const configuredIdentity = process.env.BUZZ_AXIRU_AGENT_PUBKEY ?? config.agent_pubkey;
+    if (configuredIdentity === undefined || configuredIdentity === null) {
+      this.agentPubkey = UNATTRIBUTED_PUBKEY;
+    } else {
+      const normalized = normalizePubkey(configuredIdentity);
+      if (normalized === null) {
+        throw new Error(
+          "buzz-axiru: BUZZ_AXIRU_AGENT_PUBKEY (or agent_pubkey) must be a valid " +
+            "64-character lowercase hex key or checksummed npub"
+        );
+      }
+      this.agentPubkey = normalized;
+    }
     // FAIL CLOSED: with zero spend controls the policy engine has
     // nothing to deny with, so every mapped payment call would execute
     // immediately while the operator believes a gate is in place. A
@@ -129,8 +210,27 @@ export class GateServer {
 
   /** Spawn the downstream server, handshake, and cache its tool list. */
   async start(): Promise<void> {
-    await this.downstream.start(LATEST_PROTOCOL_VERSION, this.version);
-    this.downstreamTools = await this.downstream.listTools();
+    // One enforcing gate per data directory, for the gate's lifetime
+    // (external 0.5 review): the short critical-section lock already
+    // serializes writes, but two gates can still each read a cap
+    // snapshot the other is about to invalidate. The lease turns that
+    // misconfiguration into a loud startup refusal.
+    this.releaseServingLease = acquireServingLease(this.config.data_dir);
+    try {
+      await this.downstream.start(
+        LATEST_PROTOCOL_VERSION,
+        this.version,
+        SUPPORTED_PROTOCOL_VERSIONS
+      );
+      this.downstreamTools = await this.downstream.listTools();
+      this.startAfterLease();
+    } catch (err) {
+      this.close();
+      throw err;
+    }
+  }
+
+  private startAfterLease(): void {
     const gated = this.downstreamTools
       .map((tool) => tool.name)
       .filter((name) => this.isGated(name));
@@ -142,7 +242,6 @@ export class GateServer {
     // startup warning on a background MCP server's stderr is a warning
     // nobody reads.
     if (!this.gateAll && gated.length === 0) {
-      this.downstream.close();
       throw new Error(
         "buzz-axiru: payment_tools is configured, but no exposed downstream tool matches " +
           "any gate pattern. Refusing to start an enforcing gate that protects nothing. " +
@@ -213,6 +312,8 @@ export class GateServer {
 
   close(): void {
     this.downstream.close();
+    this.releaseServingLease?.();
+    this.releaseServingLease = null;
   }
 
   /**
@@ -409,13 +510,55 @@ export class GateServer {
     args: Record<string, unknown>
   ): Promise<string> {
     const now = this.clock();
-    const callFingerprint = sha256Fingerprint({
-      v: 1,
-      kind: "buzz-axiru.gated_call",
-      tool: name,
-      arguments: args as never,
-      agent_pubkey: this.agentPubkey
-    });
+    const callFingerprint = gatedCallFingerprint(name, args, this.agentPubkey);
+
+    // Replay barrier for direct (no-approval) calls (external 0.5
+    // review). A successful exact call is never re-executed just
+    // because the agent missed the response, and an exact call whose
+    // outcome is still ambiguous is held rather than retried: money may
+    // already have moved.
+    const priorDirect = this.bridge.ledger.latestDirectExecution(callFingerprint);
+    if (priorDirect?.execution_status === "executed") {
+      return response(
+        id,
+        textResult(
+          {
+            status: "already_executed",
+            executed: true,
+            decision: "deduplicated",
+            reason_code: "bridge.execution.duplicate_suppressed",
+            fingerprint: callFingerprint,
+            executed_at: priorDirect.ts,
+            guidance:
+              "This exact payment call already completed and the gate suppressed a duplicate. " +
+              "Do not issue it again; retrieve its receipt from the payment provider using the " +
+              "business idempotency key in the original arguments."
+          },
+          false
+        )
+      );
+    }
+    if (priorDirect?.execution_status === "in_progress") {
+      return response(
+        id,
+        textResult(
+          {
+            status: "execution_outcome_unknown",
+            executed: "unknown",
+            decision: "hold",
+            reason_code: "bridge.execution.reconciliation_required",
+            fingerprint: callFingerprint,
+            execution_started_at: priorDirect.ts,
+            guidance:
+              "This exact call was durably claimed but its downstream outcome was lost. The gate " +
+              "suppressed a retry because money may already have moved. Verify with the payment " +
+              "provider, then run `buzz-axiru reconcile " + callFingerprint + "`. Do not vary " +
+              "arguments to bypass this hold."
+          },
+          true
+        )
+      );
+    }
 
     // A prior decision for this exact call outranks re-evaluation.
     const existing = this.bridge.approvals.byFingerprint(callFingerprint);
@@ -477,14 +620,60 @@ export class GateServer {
       agent_pubkey: this.agentPubkey
     };
 
-    let result;
-    try {
-      ({ result } = this.bridge.policyEvaluate(request, now));
-    } catch (err) {
+    let result: ReturnType<Bridge["policyEvaluate"]>["result"] | undefined;
+    let evaluationError: unknown;
+    // Cap snapshot, policy decision, decision record, and the direct
+    // pre-execution claim share ONE critical section (external 0.5
+    // review). The claim is durable BEFORE the network side effect, so
+    // a crash on either side of the downstream call leaves an
+    // in_progress reservation instead of a replayable, uncounted call.
+    // The data-dir lock is reentrant, so the nested ledger appends are
+    // safe.
+    withDataDirLock(this.config.data_dir, () => {
+      try {
+        ({ result } = this.bridge.policyEvaluate(request, now));
+      } catch (err) {
+        evaluationError = err;
+        return;
+      }
+      this.bridge.ledger.append({
+        type: "decision",
+        actor: this.agentPubkey,
+        agent_pubkey: this.agentPubkey,
+        decision: result.decision,
+        reason_code: result.reason_code,
+        amount_minor_units: extraction.amount_minor_units,
+        currency: extraction.currency,
+        counterparty: extraction.counterparty,
+        memo,
+        fingerprint: callFingerprint,
+        policy_fingerprint: result.fingerprint,
+        tool_name: name,
+        ts: now.toISOString()
+      });
+      if (result.decision === "allow") {
+        this.appendExecution(
+          name,
+          {
+            approval_id: undefined,
+            fingerprint: callFingerprint,
+            amount_minor_units: extraction.amount_minor_units,
+            currency: extraction.currency,
+            counterparty: extraction.counterparty,
+            memo,
+            now
+          },
+          "in_progress",
+          undefined
+        );
+      }
+    });
+    if (result === undefined) {
       // Unevaluable input (currency mismatch shapes, etc.): fail closed.
       return this.parkCall(id, name, args, callFingerprint, now, {
         reason_code: "bridge.pending.policy_unevaluable",
-        reason_text: (err as Error).message,
+        reason_text:
+          evaluationError instanceof Error ? evaluationError.message : String(evaluationError),
         amount_minor_units: extraction.amount_minor_units,
         currency: extraction.currency,
         counterparty: extraction.counterparty,
@@ -492,22 +681,6 @@ export class GateServer {
         policy_fingerprint: undefined
       });
     }
-
-    this.bridge.ledger.append({
-      type: "decision",
-      actor: this.agentPubkey,
-      agent_pubkey: this.agentPubkey,
-      decision: result.decision,
-      reason_code: result.reason_code,
-      amount_minor_units: extraction.amount_minor_units,
-      currency: extraction.currency,
-      counterparty: extraction.counterparty,
-      memo,
-      fingerprint: callFingerprint,
-      policy_fingerprint: result.fingerprint,
-      tool_name: name,
-      ts: now.toISOString()
-    });
 
     if (result.decision === "deny") {
       return response(
@@ -611,6 +784,14 @@ export class GateServer {
         if (existing.execution_status === undefined) {
           // Granted but the poller has not executed it yet: do so now.
           const executed = await this.executeApproved(existing, now);
+          if (
+            executed.execution_status === "executed" ||
+            executed.execution_status === "failed" ||
+            (executed.execution_status === "in_progress" &&
+              executed.execution_error !== undefined)
+          ) {
+            await notifyApprovalDecided(this.config, executed);
+          }
           return this.approvedOutcomeResponse(id, executed);
         }
         return this.approvedOutcomeResponse(id, existing);
@@ -663,12 +844,18 @@ export class GateServer {
         id,
         textResult(
           {
-            status: "execution_in_progress_or_unknown",
+            status:
+              approval.execution_error !== undefined
+                ? "execution_outcome_unknown"
+                : "execution_in_progress_or_unknown",
             executed: "unknown",
             decision: "hold",
             reason_code: "bridge.execution.reconciliation_required",
             approval_id: approval.approval_id,
             execution_started_at: approval.execution_started_at ?? null,
+            ...(approval.execution_error !== undefined
+              ? { error: approval.execution_error }
+              : {}),
             guidance:
               "This approved call was durably claimed for execution, but no final outcome is recorded yet. " +
               "The gate will not retry it because the downstream may already have moved money. Verify the " +
@@ -829,12 +1016,42 @@ export class GateServer {
       now: Date;
     }
   ): Promise<string> {
+    // The caller durably recorded the in-progress claim in the same
+    // critical section as its cap snapshot and allow decision. From the
+    // first network operation onward, every failure must finalize or
+    // preserve that claim, never discard it.
     try {
-      const result = await this.downstream.callTool(name, args);
+      const result = checkedToolResult(await this.downstream.callTool(name, args));
       this.appendExecution(name, meta, "executed", undefined);
-      return response(id, (result ?? {}) as Record<string, unknown>);
+      return response(id, result);
     } catch (err) {
-      this.appendExecution(name, meta, "failed", (err as Error).message);
+      const error = executionErrorText(err);
+      if (outcomeIsUnknown(err)) {
+        // No approval record exists for a direct allow, so the ledger's
+        // in_progress record is both the durable cap reservation and
+        // the operator-visible incident.
+        this.appendExecution(name, meta, "in_progress", error);
+        return response(
+          id,
+          textResult(
+            {
+              status: "execution_outcome_unknown",
+              executed: "unknown",
+              decision: "hold",
+              reason_code: "bridge.execution.reconciliation_required",
+              fingerprint: meta.fingerprint,
+              error,
+              guidance:
+                "The downstream server received this call but no definitive outcome reached the " +
+                "gate. Do NOT retry: money may already have moved, and this amount is reserved " +
+                "against the cap. Verify with the payment provider, then run `buzz-axiru " +
+                "reconcile " + meta.fingerprint + "`."
+            },
+            true
+          )
+        );
+      }
+      this.appendExecution(name, meta, "failed", error);
       return response(
         id,
         textResult(
@@ -842,7 +1059,7 @@ export class GateServer {
             status: "execution_failed",
             executed: false,
             reason_code: "bridge.execution.failed",
-            error: (err as Error).message,
+            error,
             guidance:
               "Policy allowed this call but the downstream payment server failed to execute it. " +
               "The failure is recorded in the decision log."
@@ -865,7 +1082,8 @@ export class GateServer {
       now: Date;
     },
     status: "in_progress" | "executed" | "failed",
-    error: string | undefined
+    error: string | undefined,
+    resultFingerprint?: string
   ): void {
     this.bridge.ledger.append({
       type: "execution",
@@ -873,7 +1091,9 @@ export class GateServer {
       agent_pubkey: this.agentPubkey,
       reason_code:
         status === "in_progress"
-          ? "bridge.execution.started"
+          ? error === undefined
+            ? "bridge.execution.started"
+            : "bridge.execution.outcome_unknown"
           : status === "executed"
             ? "bridge.execution.ok"
             : "bridge.execution.failed",
@@ -885,6 +1105,7 @@ export class GateServer {
       tool_name: name,
       execution_status: status,
       ...(error !== undefined ? { error } : {}),
+      ...(resultFingerprint !== undefined ? { result_fingerprint: resultFingerprint } : {}),
       ...(meta.approval_id !== undefined ? { approval_id: meta.approval_id } : {}),
       ts: meta.now.toISOString()
     });
@@ -905,6 +1126,40 @@ export class GateServer {
       ...(approval.call !== undefined ? { tool_name: approval.call.tool_name } : {}),
       ts: now.toISOString()
     });
+  }
+
+  /**
+   * Re-derive the human-visible payment fields from the parked call
+   * immediately before execution. The store's fingerprint binding
+   * already proves the arguments are the approved bytes; this proves
+   * the amount, currency, and counterparty the approver saw still
+   * describe those bytes under the CURRENT mapping config.
+   */
+  private approvalCallProblem(approval: ApprovalRequest): string | null {
+    if (approval.call === undefined) return "the granted approval has no parked call";
+    const extraction = extractPayment(
+      this.config,
+      approval.call.tool_name,
+      approval.call.arguments
+    );
+    if (!extraction.ok) {
+      if (
+        approval.amount_minor_units !== "unknown" ||
+        approval.currency !== this.config.currency ||
+        approval.counterparty !== `tool:${approval.call.tool_name}`
+      ) {
+        return "the parked call no longer matches the amount, currency, and counterparty shown to the approver";
+      }
+      return null;
+    }
+    if (
+      approval.amount_minor_units !== extraction.amount_minor_units ||
+      approval.currency !== extraction.currency ||
+      approval.counterparty !== extraction.counterparty
+    ) {
+      return "the parked call no longer matches the amount, currency, and counterparty shown to the approver";
+    }
+    return null;
   }
 
   /** Durably claim and execute one granted parked call downstream. */
@@ -937,25 +1192,61 @@ export class GateServer {
         memo: claimed.memo,
         now
       };
+      // Cross-check the mutable store against the hash-chained ledger
+      // and re-derive the human-visible payment fields immediately
+      // before money moves (external 0.5 review, narrowed to the
+      // execution boundary). A grant that only exists in the store, or
+      // a parked call that no longer extracts to the amount the human
+      // saw, is refused and the grant is spent.
+      const stateProblem =
+        this.bridge.ledger.grantRecordProblem(claimed) ?? this.approvalCallProblem(claimed);
+      if (stateProblem !== null) {
+        const error = `approval state integrity check failed: ${stateProblem}`;
+        this.appendExecution(call.tool_name, meta, "failed", error);
+        return this.bridge.approvals.recordExecution(claimed.approval_id, {
+          status: "failed",
+          error,
+          at: now
+        });
+      }
       // Audit the claim before the network side effect. Any failure
       // from here onward leaves the approval non-retryable and
       // requiring manual reconciliation.
       this.appendExecution(call.tool_name, meta, "in_progress", undefined);
       let result: unknown;
       try {
-        result = await this.downstream.callTool(call.tool_name, call.arguments);
+        result = checkedToolResult(
+          await this.downstream.callTool(call.tool_name, call.arguments)
+        );
       } catch (err) {
-        this.appendExecution(call.tool_name, meta, "failed", (err as Error).message);
+        const error = executionErrorText(err);
+        if (outcomeIsUnknown(err)) {
+          // The transport lost the outcome, not the call. Keep the
+          // claim in_progress (non-retryable, cap-reserving) and attach
+          // the evidence for `pending` and the operator.
+          this.appendExecution(call.tool_name, meta, "in_progress", error);
+          return this.bridge.approvals.recordExecutionUncertain(claimed.approval_id, error);
+        }
+        this.appendExecution(call.tool_name, meta, "failed", error);
         return this.bridge.approvals.recordExecution(claimed.approval_id, {
           status: "failed",
-          error: (err as Error).message,
+          error,
           at: now
         });
       }
       // Keep persistence failures out of the downstream-error catch.
       // If either write fails after the provider returned success, the
       // durable claim remains in_progress and therefore non-retryable.
-      this.appendExecution(call.tool_name, meta, "executed", undefined);
+      // The result fingerprint binds the retained provider result to
+      // the hash chain, so a later store edit cannot silently change
+      // what an idempotent re-read returns.
+      this.appendExecution(
+        call.tool_name,
+        meta,
+        "executed",
+        undefined,
+        executionResultFingerprint(result)
+      );
       return this.bridge.approvals.recordExecution(claimed.approval_id, {
         status: "executed",
         result,
@@ -985,8 +1276,14 @@ export class GateServer {
     for (const approval of this.granteesAwaitingExecution()) {
       const executed = await this.executeApproved(approval, now);
       // An approval left in_progress by a crash is deliberately NOT a
-      // decided outcome; the operator resolves it via `reconcile`.
-      if (executed.execution_status === "executed" || executed.execution_status === "failed") {
+      // decided outcome; the operator resolves it via `reconcile`. An
+      // in_progress claim WITH attached evidence is a fresh ambiguous
+      // outcome, and the operator should hear about it now.
+      if (
+        executed.execution_status === "executed" ||
+        executed.execution_status === "failed" ||
+        (executed.execution_status === "in_progress" && executed.execution_error !== undefined)
+      ) {
         await notifyApprovalDecided(this.config, executed);
       }
     }

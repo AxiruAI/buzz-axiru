@@ -23,7 +23,7 @@ import { join } from "node:path";
 import { guardAgentSpend, type GuardReason, type GuardResult } from "@axiru/agent-spend-guardrails";
 
 import { ApprovalStore, isExpired } from "./approvals.js";
-import { isPlausiblePubkey, policiesForAgent, type BridgeConfig } from "./config.js";
+import { normalizePubkey, policiesForAgent, type BridgeConfig } from "./config.js";
 import { Ledger, type AgentHistory, type LedgerRecord } from "./ledger.js";
 import { notifyApprovalRequested } from "./notify.js";
 
@@ -74,20 +74,39 @@ export class Bridge {
     if (typeof request.memo !== "string") {
       return "memo must be a string";
     }
-    if (typeof request.agent_pubkey !== "string" || !isPlausiblePubkey(request.agent_pubkey)) {
-      return "agent_pubkey must be the agent's Nostr pubkey (64-char lowercase hex, or npub form)";
+    const canonical =
+      typeof request.agent_pubkey === "string" ? normalizePubkey(request.agent_pubkey) : null;
+    if (canonical === null) {
+      return "agent_pubkey must be the agent's Nostr pubkey (64-char lowercase hex, or checksummed npub form)";
     }
     // The env var wins, then policies.json. Reading only the env var
     // meant an operator who pinned agent_pubkey in the config file got
     // no pinning at all in advisory mode, while gate mode honoured it:
     // the per-agent daily cap is keyed on this string, so an unpinned
     // advisory bridge lets an agent reset its own cap by picking a
-    // different pubkey on the next call.
-    const pinned = process.env.BUZZ_AXIRU_AGENT_PUBKEY ?? this.config.agent_pubkey;
-    if (pinned && pinned !== request.agent_pubkey) {
+    // different pubkey on the next call. Both sides are canonicalized,
+    // so the hex and npub spellings of one key compare equal.
+    const pinnedRaw = process.env.BUZZ_AXIRU_AGENT_PUBKEY ?? this.config.agent_pubkey;
+    const pinned = pinnedRaw ? (normalizePubkey(pinnedRaw) ?? pinnedRaw) : pinnedRaw;
+    if (pinned && pinned !== canonical) {
       return `agent_pubkey does not match the pinned identity this bridge instance was started for`;
     }
     return null;
+  }
+
+  /**
+   * Canonicalize the identity BEFORE it keys anything (external 0.5
+   * review): cap history, policy initiator ids, approval records, and
+   * ledger attribution all key on this string, and accepting the hex
+   * and npub spellings of one key as two identities let a single agent
+   * spend up to twice its per-agent daily cap.
+   */
+  private canonicalized(request: SpendRequest): SpendRequest {
+    if (typeof request.agent_pubkey !== "string") return request;
+    const canonical = normalizePubkey(request.agent_pubkey);
+    return canonical === null || canonical === request.agent_pubkey
+      ? request
+      : { ...request, agent_pubkey: canonical };
   }
 
   /**
@@ -96,7 +115,8 @@ export class Bridge {
    * approval-queue side effects. Gate mode composes this with its own
    * orchestration; advisory evaluate() builds on it below.
    */
-  policyEvaluate(request: SpendRequest, now?: Date): { result: GuardResult; clock: Date; currency: string } {
+  policyEvaluate(rawRequest: SpendRequest, now?: Date): { result: GuardResult; clock: Date; currency: string } {
+    const request = this.canonicalized(rawRequest);
     const problem = this.validate(request);
     if (problem) {
       throw new TypeError(`buzz-axiru: invalid request: ${problem}`);
@@ -200,7 +220,8 @@ export class Bridge {
    * tests and replay; production callers omit it, and the server clock
    * is used so agents cannot influence time-of-day policy evaluation.
    */
-  async evaluate(request: SpendRequest, now?: Date): Promise<SpendDecision> {
+  async evaluate(rawRequest: SpendRequest, now?: Date): Promise<SpendDecision> {
+    const request = this.canonicalized(rawRequest);
     const { result, clock, currency } = this.policyEvaluate(request, now);
 
     // Human decisions for this exact intent outrank re-evaluation.

@@ -33,6 +33,8 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 
+import { sha256Fingerprint } from "@axiru/agent-spend-guardrails";
+
 import { withDataDirLock } from "./lock.js";
 
 export type ApprovalStatus = "pending" | "granted" | "denied" | "expired";
@@ -81,6 +83,8 @@ export interface ApprovalRequest {
   expires_at?: string;
   /** Gate mode: the original tool call to execute after a grant. */
   call?: ParkedCall;
+  /** Exact arguments are removed after a final outcome to minimize secret retention. */
+  call_arguments_redacted?: boolean;
   /**
    * Gate-mode execution status. `in_progress` is a durable,
    * pre-execution claim. Once written, a
@@ -122,6 +126,29 @@ export function legacyApprovalIdForFingerprint(fingerprint: string): string {
   return hexOfFingerprint(fingerprint).slice(0, LEGACY_APPROVAL_ID_HEX);
 }
 
+export function gatedCallFingerprint(
+  toolName: string,
+  args: Record<string, unknown>,
+  agentPubkey: string
+): string {
+  return sha256Fingerprint({
+    v: 1,
+    kind: "buzz-axiru.gated_call",
+    tool: toolName,
+    arguments: args as never,
+    agent_pubkey: agentPubkey
+  });
+}
+
+/** Bind a retained downstream result to the execution ledger record. */
+export function executionResultFingerprint(result: unknown): string {
+  return sha256Fingerprint({
+    v: 1,
+    kind: "buzz-axiru.downstream_result",
+    result: result as never
+  });
+}
+
 export function isExpired(approval: ApprovalRequest, now: Date): boolean {
   if (approval.expires_at === undefined) return false;
   const at = Date.parse(approval.expires_at);
@@ -152,6 +179,12 @@ function approvalProblem(key: string, value: unknown): string | null {
   if (typeof approval.fingerprint !== "string" || !FINGERPRINT.test(approval.fingerprint)) {
     return `record "${key}" has an invalid fingerprint`;
   }
+  if (
+    key !== approvalIdForFingerprint(approval.fingerprint) &&
+    key !== legacyApprovalIdForFingerprint(approval.fingerprint)
+  ) {
+    return `record "${key}" is not derived from its fingerprint`;
+  }
   if (!APPROVAL_STATUSES.has(approval.status as ApprovalStatus)) {
     return `record "${key}" has an invalid status`;
   }
@@ -172,6 +205,27 @@ function approvalProblem(key: string, value: unknown): string | null {
   ) {
     return `record "${key}" has an invalid execution_status`;
   }
+  if (
+    approval.call_arguments_redacted !== undefined &&
+    typeof approval.call_arguments_redacted !== "boolean"
+  ) {
+    return `record "${key}" has an invalid call_arguments_redacted flag`;
+  }
+  if (approval.execution_status !== undefined && approval.status !== "granted") {
+    return `record "${key}" has execution state without a grant`;
+  }
+  if (
+    approval.execution_error !== undefined &&
+    (typeof approval.execution_error !== "string" || approval.execution_error.length > 1_000)
+  ) {
+    return `record "${key}" has an invalid execution_error`;
+  }
+  if (approval.execution_result !== undefined) {
+    const resultShape = boundedJsonProblem(approval.execution_result);
+    if (resultShape !== null) {
+      return `record "${key}" has an unsafe execution_result: ${resultShape}`;
+    }
+  }
   if (approval.call !== undefined) {
     if (
       typeof approval.call !== "object" ||
@@ -183,12 +237,77 @@ function approvalProblem(key: string, value: unknown): string | null {
     ) {
       return `record "${key}" has an invalid parked call`;
     }
+    const shape = boundedJsonProblem(approval.call.arguments);
+    if (shape !== null) return `record "${key}" has unsafe parked arguments: ${shape}`;
+    if (approval.call_arguments_redacted === true) {
+      const isFinal =
+        approval.status === "denied" ||
+        approval.status === "expired" ||
+        approval.execution_status === "executed" ||
+        approval.execution_status === "failed";
+      if (!isFinal || Object.keys(approval.call.arguments).length !== 0) {
+        return `record "${key}" has inconsistent redacted parked arguments`;
+      }
+    } else {
+      let actual: string;
+      try {
+        actual = gatedCallFingerprint(
+          approval.call.tool_name,
+          approval.call.arguments,
+          approval.agent_pubkey!
+        );
+      } catch {
+        return `record "${key}" has parked arguments that cannot be fingerprinted`;
+      }
+      if (actual !== approval.fingerprint) {
+        return `record "${key}" parked call does not match its approved fingerprint`;
+      }
+    }
+  }
+  return null;
+}
+
+function boundedJsonProblem(value: unknown): string | null {
+  const stack: Array<{ value: unknown; depth: number }> = [{ value, depth: 1 }];
+  let nodes = 0;
+  let chars = 0;
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    nodes += 1;
+    if (nodes > 20_000) return "more than 20000 values";
+    if (current.depth > 64) return "more than 64 levels";
+    const kind = typeof current.value;
+    if (
+      kind === "undefined" ||
+      kind === "function" ||
+      kind === "symbol" ||
+      kind === "bigint" ||
+      (kind === "number" && !Number.isFinite(current.value))
+    ) {
+      return "a non-JSON value";
+    }
+    if (typeof current.value === "string") chars += current.value.length;
+    if (Array.isArray(current.value)) {
+      for (const child of current.value) stack.push({ value: child, depth: current.depth + 1 });
+    } else if (typeof current.value === "object" && current.value !== null) {
+      for (const [childKey, child] of Object.entries(current.value as Record<string, unknown>)) {
+        chars += childKey.length;
+        stack.push({ value: child, depth: current.depth + 1 });
+      }
+    }
+    if (chars > 262_144) return "more than 262144 string characters";
   }
   return null;
 }
 
 function own(all: ApprovalMap, id: string): ApprovalRequest | undefined {
   return Object.prototype.hasOwnProperty.call(all, id) ? all[id] : undefined;
+}
+
+function redactFinalCall(approval: ApprovalRequest): void {
+  if (approval.call === undefined) return;
+  approval.call = { tool_name: approval.call.tool_name, arguments: {} };
+  approval.call_arguments_redacted = true;
 }
 
 /** Resolve an exact fingerprint, including a pre-0.3 short-key record. */
@@ -211,6 +330,10 @@ export class ApprovalStore {
   constructor(dataDir: string) {
     this.dataDir = dataDir;
     this.filePath = join(dataDir, "approvals.json");
+    mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    // Tighten an existing store too; otherwise a file restored with a
+    // permissive umask remains world-readable until its next mutation.
+    if (existsSync(this.filePath)) chmodSync(this.filePath, 0o600);
   }
 
   /** Run one read-modify-write under the data directory lock. */
@@ -326,6 +449,10 @@ export class ApprovalStore {
       requested_at: now.toISOString(),
       status: "pending"
     };
+    const problem = approvalProblem(id, created);
+    if (problem !== null) {
+      throw new Error(`buzz-axiru: refusing to create an invalid approval: ${problem}`);
+    }
     all[id] = created;
     this.save(all);
     return created;
@@ -346,6 +473,7 @@ export class ApprovalStore {
       }
       if (approval.status === "pending" && isExpired(approval, now)) {
         approval.status = "expired";
+        redactFinalCall(approval);
         this.save(all);
         throw new Error(
           `buzz-axiru: approval ${approvalId} expired at ${approval.expires_at} and can no longer be ${status}`
@@ -361,6 +489,7 @@ export class ApprovalStore {
       approval.decided_by = decidedBy;
       approval.decided_at = now.toISOString();
       if (note !== undefined) approval.note = note;
+      if (status === "denied") redactFinalCall(approval);
       this.save(all);
       return approval;
     });
@@ -379,6 +508,7 @@ export class ApprovalStore {
         return undefined;
       }
       approval.status = "expired";
+      redactFinalCall(approval);
       this.save(all);
       return approval;
     });
@@ -406,9 +536,35 @@ export class ApprovalStore {
       approval.executed_at = outcome.at.toISOString();
       if (outcome.status === "executed") {
         approval.execution_result = outcome.result;
+        delete approval.execution_error;
       } else {
         approval.execution_error = outcome.error;
+        delete approval.execution_result;
       }
+      approval.consumed = true;
+      redactFinalCall(approval);
+      this.save(all);
+      return approval;
+    });
+  }
+
+  /**
+   * Attach evidence to an execution claim whose transport outcome is
+   * ambiguous, while deliberately keeping it in_progress and therefore
+   * non-retryable until an operator reconciles it.
+   */
+  recordExecutionUncertain(approvalId: string, error: string): ApprovalRequest {
+    return this.locked(() => {
+      const all = this.load();
+      const approval = own(all, approvalId);
+      if (!approval) throw new Error(`buzz-axiru: no approval with id ${approvalId}`);
+      if (approval.status !== "granted" || approval.execution_status !== "in_progress") {
+        throw new Error(
+          `buzz-axiru: approval ${approvalId} has no active execution claim; ` +
+            "refusing to attach an ambiguous outcome"
+        );
+      }
+      approval.execution_error = error;
       approval.consumed = true;
       this.save(all);
       return approval;
