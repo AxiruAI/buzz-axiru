@@ -8,14 +8,14 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { ApprovalStore } from "../src/approvals.js";
-import { verifyLedger } from "../src/ledger.js";
+import { Ledger, verifyLedger } from "../src/ledger.js";
 import { AGENT_PUBKEY, NOON_UTC, TEST_POLICY_DOC } from "./helpers.js";
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
@@ -201,4 +201,44 @@ test("doctor distinguishes a ready gate from a matcher that protects nothing", (
   });
   assert.equal(unsafe.status, 1);
   assert.match(String(unsafe.stdout), /NOT READY.*Nothing is currently protected/s);
+});
+
+test("verify exits 1 and names the sequence for an out-of-band forgery", () => {
+  const dir = mkdtempSync(join(tmpdir(), "buzz-axiru-cli-verify-"));
+  const policies = join(dir, "policies.json");
+  writeFileSync(policies, JSON.stringify(TEST_POLICY_DOC));
+  const ledgerPath = join(dir, "data", "ledger.jsonl");
+  const ledger = new Ledger(ledgerPath);
+  for (const memo of ["one", "two", "three"]) {
+    ledger.append({
+      type: "decision",
+      actor: AGENT_PUBKEY,
+      agent_pubkey: AGENT_PUBKEY,
+      decision: "allow",
+      reason_code: "guardrails.allow.default",
+      amount_minor_units: "200",
+      currency: "USD",
+      counterparty: "cloudsmith.example",
+      memo,
+      fingerprint: "sha256:" + "4b".repeat(32)
+    });
+  }
+  // Same-size in-place forgery of record 2: invisible to a running
+  // instance's checkpoint, and exactly what the CLI full pass is for.
+  // Forge a copy so the bridge's own ledger (which every CLI command
+  // opens, and which refuses to open corrupted) stays clean.
+  const forgedPath = ledgerPath + ".forged";
+  const lines = readFileSync(ledgerPath, "utf8").trim().split("\n");
+  lines[1] = lines[1]!.replace('"amount_minor_units":"200"', '"amount_minor_units":"999"');
+  writeFileSync(forgedPath, lines.join("\n") + "\n");
+
+  const result = spawnSync(
+    process.execPath,
+    [CLI_PATH, "verify", "--policies", policies, "--ledger", forgedPath],
+    { cwd: dir, encoding: "utf8" }
+  );
+  assert.equal(result.status, 1);
+  const report = JSON.parse(String(result.stdout)) as { ok: boolean; bad_seq?: number };
+  assert.equal(report.ok, false);
+  assert.equal(report.bad_seq, 2);
 });

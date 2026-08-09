@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.4.1
+
+Performance and availability release. The issue was reported by an external
+review, reproduced with a benchmark before any code changed, and re-measured
+after the fix.
+
+- Availability fix: every ledger append re-read, re-parsed, and re-hashed the
+  entire ledger file, and every decision's history scan re-verified the full
+  chain, so per-operation cost grew linearly with ledger size and total cost
+  grew quadratically over the ledger's life. Appends run under the data
+  directory lock, so a long-lived gate or a runaway agent eventually slowed
+  every append and every spend decision toward seconds. Measured before the
+  fix (median per operation): appends 12 ms at 500 records, 92 ms at 3,000,
+  138 ms at 6,000, and still climbing; decisions tracked the same curve.
+- The `Ledger` now keeps a verified checkpoint (last sequence, head hash,
+  byte offset) and verifies only records appended after it, chaining onto the
+  known-good head. Records appended by another process (the serve process and
+  the approve/deny CLI interleave) are detected by file growth and verified
+  as a delta; that is the normal case, not an anomaly. Measured after the
+  fix: appends are flat at 2 to 3 ms from 500 through 20,000 records.
+- Full from-genesis verification is preserved: at every `Ledger` open, in
+  `buzz-axiru verify`, in `doctor`, and as the automatic fallback whenever
+  the incremental pass sees anything unexpected (unparseable line, sequence
+  or hash mismatch, file shrinkage, head divergence). If the fallback fails,
+  the bridge still refuses to append or compute history, loudly.
+- Integrity nuance, stated plainly: an in-place, same-size edit of a record
+  the running process has already verified is caught at the next full pass
+  (restart, `verify`, `doctor`) rather than at the next decision. That is
+  consistent with the tamper-evident, not tamper-proof, model the README has
+  always documented, and it is now written down there too.
+- `doctor` now runs a full ledger verification and reports ledger state:
+  record count, head hash, and verification mode.
+
 ## 0.4.0
 
 Security release. Several items originate from an external review of the 0.4

@@ -48,7 +48,7 @@ import {
 } from "./quickstart.js";
 import { STARTER_POLICIES } from "./scaffold.js";
 
-const VERSION = "0.4.0";
+const VERSION = "0.4.1";
 
 interface ParsedArgs {
   command: string;
@@ -218,6 +218,26 @@ function runQuickstart(flags: Record<string, string>): void {
 async function runQuickstartCheck(flags: Record<string, string>): Promise<void> {
   const config = loadConfig(flags.policies, flags["data-dir"]);
   process.stdout.write(`buzz-axiru ${VERSION} security readiness check\npolicies: ${config.config_path}\n\n`);
+  // Full chain verification, on purpose: doctor and verify are the
+  // scheduled full passes in the incremental-verification model, so
+  // this is where a tamper of an already-verified prefix surfaces.
+  const ledgerPath = join(config.data_dir, "ledger.jsonl");
+  const ledgerState = verifyLedger(ledgerPath);
+  if (ledgerState.ok) {
+    process.stdout.write(
+      `ledger: ${ledgerState.records} record(s), head ` +
+        `${ledgerState.records > 0 ? ledgerState.head_hash : "genesis (empty)"}\n` +
+        "        verification: full chain verified now and at every process start;\n" +
+        "        incremental from a verified checkpoint per append and decision\n\n"
+    );
+  } else {
+    process.stdout.write(
+      `[NOT READY] Ledger integrity check failed at sequence ${ledgerState.bad_seq}: ` +
+        `${ledgerState.reason}. Run \`buzz-axiru verify\` and restore the ledger from a ` +
+        "trusted copy before serving.\n\n"
+    );
+    process.exitCode = 1;
+  }
   if (config.downstream === null) {
     process.stdout.write(
       "[PASS] Config loads.\n" +

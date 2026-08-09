@@ -24,7 +24,7 @@ import { guardAgentSpend, type GuardReason, type GuardResult } from "@axiru/agen
 
 import { ApprovalStore, isExpired } from "./approvals.js";
 import { isPlausiblePubkey, policiesForAgent, type BridgeConfig } from "./config.js";
-import { historyForAgent, Ledger, type AgentHistory, type LedgerRecord } from "./ledger.js";
+import { Ledger, type AgentHistory, type LedgerRecord } from "./ledger.js";
 import { notifyApprovalRequested } from "./notify.js";
 
 export interface SpendRequest {
@@ -121,8 +121,10 @@ export class Bridge {
       );
     }
 
-    const recordedHistory = historyForAgent(
-      this.ledger.filePath,
+    // Instance method, not the standalone function: it verifies only
+    // records past the ledger's checkpoint, so decision latency stays
+    // flat as the ledger grows.
+    const recordedHistory = this.ledger.historyForAgent(
       request.agent_pubkey,
       this.config.currency,
       clock

@@ -476,6 +476,18 @@ Read this section before trusting the gate with anything.
   consistent chain from genesis, and it cannot by itself catch a truncation
   of the tail. Copy the head hash somewhere the agent cannot write if you need
   either; the local bridge does not automate external anchoring.
+- Verification cost does not grow with ledger age. A running bridge keeps a
+  verified checkpoint (last sequence, head hash, byte offset) and verifies
+  only records appended after it, so appends and decisions stay flat while
+  the ledger grows. The full chain is still re-derived at every process
+  start, by `buzz-axiru verify` and `doctor`, and automatically whenever an
+  append or history read sees anything it cannot explain (a record that does
+  not chain, an unparseable line, a file that shrank). The trade, stated
+  plainly: an in-place, same-size edit of a record the running process has
+  already verified is caught at the next full pass (restart, `verify`,
+  `doctor`), not at the next decision. That sits inside the tamper-evident
+  model above; schedule `buzz-axiru verify` if you want a tighter detection
+  bound.
 - Business-hours policy knows hours and timezones, not weekends or holidays.
 - The channel-post adapter shells out to the `buzz` CLI; if the CLI is absent
   or the relay is down, the approval still exists locally and is listed by
