@@ -140,6 +140,10 @@ export async function serveNdjson(
         output.write(oversize() + "\n");
         continue;
       }
+      if (line.length > MAX_LINE_CHARS) {
+        output.write(oversize() + "\n");
+        continue;
+      }
       if (line.trim().length === 0) continue;
       const reply = await handle(line);
       if (reply !== null) output.write(reply + "\n");
@@ -160,6 +164,10 @@ export interface JsonRpcRequest {
 }
 
 type Json = Record<string, unknown>;
+
+export function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
 export function response(id: number | string | null, result: Json): string {
   return JSON.stringify({ jsonrpc: "2.0", id, result });
@@ -190,9 +198,17 @@ export class McpServer {
   private async dispatch(raw: string): Promise<string | null> {
     let message: JsonRpcRequest;
     try {
-      message = JSON.parse(raw) as JsonRpcRequest;
+      const parsed = JSON.parse(raw) as unknown;
+      if (!isJsonObject(parsed)) return errorResponse(null, -32600, "Invalid Request: expected an object");
+      message = parsed as unknown as JsonRpcRequest;
     } catch {
       return errorResponse(null, -32700, "Parse error: not valid JSON");
+    }
+    if (message.jsonrpc !== "2.0" || typeof message.method !== "string") {
+      return errorResponse(null, -32600, "Invalid Request: expected jsonrpc \"2.0\" and a method");
+    }
+    if (message.params !== undefined && !isJsonObject(message.params)) {
+      return errorResponse(message.id ?? null, -32602, "Invalid params: expected an object");
     }
     const id = message.id ?? null;
     const isNotification = message.id === undefined;
@@ -224,7 +240,11 @@ export class McpServer {
         if (name !== TOOL_NAME) {
           return errorResponse(id, -32602, `Unknown tool: ${String(name)}`);
         }
-        const args = (message.params?.arguments ?? {}) as Record<string, unknown>;
+        const rawArgs = message.params?.arguments ?? {};
+        if (!isJsonObject(rawArgs)) {
+          return errorResponse(id, -32602, "tools/call arguments must be an object");
+        }
+        const args = rawArgs;
         const problem = jsonShapeProblem(args);
         if (problem !== null) {
           return errorResponse(id, -32602, `tools/call rejected: ${problem}`);

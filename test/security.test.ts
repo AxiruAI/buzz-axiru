@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { hostname } from "node:os";
 import { join } from "node:path";
@@ -27,7 +27,11 @@ import { Bridge } from "../src/guard.js";
 import { Ledger, verifyLedger } from "../src/ledger.js";
 import { withDataDirLock } from "../src/lock.js";
 import { jsonShapeProblem } from "../src/mcp.js";
-import { approvalRequestText, sanitizeForChannel } from "../src/notify.js";
+import {
+  approvalRequestText,
+  approvalWebhookPayload,
+  sanitizeForChannel
+} from "../src/notify.js";
 import { AGENT_PUBKEY, NOON_UTC, makeBridge, TEST_POLICY_DOC } from "./helpers.js";
 
 const WRITER_PATH = fileURLToPath(new URL("./ledger-writer.js", import.meta.url));
@@ -138,7 +142,7 @@ test("a memo cannot forge extra lines in the human approval message", () => {
   const amountLines = text.split("\n").filter((line) => line.startsWith("  amount:"));
   assert.equal(amountLines.length, 1);
   assert.match(amountLines[0]!, /USD 5,000,000\.00/);
-  assert.equal(text.split("\n").filter((l) => l.startsWith("To decide:")).length, 1);
+  assert.equal(text.split("\n").filter((l) => l.startsWith("Then decide:")).length, 1);
   assert.equal(text.split("\n").filter((l) => l.startsWith("  counterparty:")).length, 1);
   assert.match(text, /counterparty: attacker\.example/);
   // The forged text survives, visibly quarantined on the memo line.
@@ -275,6 +279,22 @@ test("agent_pubkey in the config file pins advisory-mode identity", async () => 
   );
 });
 
+test("gate mode refuses an empty control set that would default to allow", () => {
+  const dir = newDir();
+  const path = join(dir, "policies.json");
+  writeFileSync(
+    path,
+    JSON.stringify({
+      ...TEST_POLICY_DOC,
+      controls: {},
+      agent_pubkey: AGENT_PUBKEY,
+      downstream: { command: process.execPath, args: [FAKE_PATH], env: {} }
+    })
+  );
+  const bridge = new Bridge(loadConfig(path, join(dir, "data")));
+  assert.throws(() => new GateServer(bridge, "test", { quiet: true }), /at least one spend control/);
+});
+
 /* ------------------------------------------------------------------ */
 /* Approval ids and queue bounds                                       */
 /* ------------------------------------------------------------------ */
@@ -307,6 +327,113 @@ test("approval ids carry 128 bits and still resolve legacy short ids", () => {
     })
   );
   assert.equal(store.byFingerprint(fingerprint)?.approval_id, legacyId);
+});
+
+test("legacy short-id compatibility never merges a colliding fingerprint", () => {
+  const original = "sha256:" + "a".repeat(12) + "b".repeat(52);
+  const collision = "sha256:" + "a".repeat(12) + "c".repeat(52);
+  const dir = newDir();
+  const legacyId = legacyApprovalIdForFingerprint(original);
+  writeFileSync(
+    join(dir, "approvals.json"),
+    JSON.stringify({
+      [legacyId]: {
+        approval_id: legacyId,
+        fingerprint: original,
+        agent_pubkey: AGENT_PUBKEY,
+        amount_minor_units: "100",
+        currency: "USD",
+        counterparty: "cloudsmith.example",
+        memo: "legacy approval",
+        reason_code: "bridge.pending.ceiling",
+        requested_at: NOON_UTC.toISOString(),
+        status: "granted"
+      }
+    })
+  );
+  const store = new ApprovalStore(dir);
+  assert.equal(store.byFingerprint(collision), undefined);
+});
+
+test("a durable execution claim has exactly one winner across store instances", () => {
+  const dir = newDir();
+  const store = new ApprovalStore(dir);
+  const approval = store.createOrGet({
+    fingerprint: "sha256:" + "7e".repeat(32),
+    agent_pubkey: AGENT_PUBKEY,
+    amount_minor_units: "5000",
+    currency: "USD",
+    counterparty: "cloudsmith.example",
+    memo: "memo-must-not-leak",
+    reason_code: "bridge.pending.ceiling",
+    call: { tool_name: "create_payment", arguments: { amount: "5000" } }
+  });
+  store.decide(approval.approval_id, "granted", "tester", undefined, NOON_UTC);
+
+  const first = store.claimExecution(approval.approval_id, NOON_UTC);
+  const afterRestart = new ApprovalStore(dir).claimExecution(approval.approval_id, NOON_UTC);
+  assert.equal(first.claimed, true);
+  assert.equal(first.approval.execution_status, "in_progress");
+  assert.equal(afterRestart.claimed, false);
+  assert.equal(afterRestart.approval.execution_status, "in_progress");
+});
+
+test("a corrupt approval store fails closed instead of becoming an empty queue", () => {
+  const dir = newDir();
+  writeFileSync(join(dir, "approvals.json"), "{not-json");
+  assert.throws(
+    () => new ApprovalStore(dir).pending(),
+    /Refusing to forget approval state/
+  );
+});
+
+test("approval and ledger files are owner-readable only", () => {
+  if (process.platform === "win32") return;
+  const dir = newDir();
+  const store = new ApprovalStore(dir);
+  store.createOrGet({
+    fingerprint: "sha256:" + "8e".repeat(32),
+    agent_pubkey: AGENT_PUBKEY,
+    amount_minor_units: "100",
+    currency: "USD",
+    counterparty: "cloudsmith.example",
+    memo: "private",
+    reason_code: "bridge.pending.ceiling"
+  });
+  const ledgerPath = join(dir, "ledger.jsonl");
+  new Ledger(ledgerPath).append({
+    type: "decision",
+    actor: AGENT_PUBKEY,
+    agent_pubkey: AGENT_PUBKEY,
+    decision: "deny",
+    reason_code: "test",
+    amount_minor_units: "100",
+    currency: "USD",
+    counterparty: "cloudsmith.example",
+    memo: "private",
+    fingerprint: "sha256:" + "8e".repeat(32)
+  });
+  assert.equal(statSync(store.filePath).mode & 0o777, 0o600);
+  assert.equal(statSync(ledgerPath).mode & 0o777, 0o600);
+});
+
+test("ledger corruption blocks reopening and future appends", () => {
+  const path = join(newDir(), "ledger.jsonl");
+  const ledger = new Ledger(path);
+  ledger.append({
+    type: "decision",
+    actor: AGENT_PUBKEY,
+    agent_pubkey: AGENT_PUBKEY,
+    decision: "allow",
+    reason_code: "test",
+    amount_minor_units: "100",
+    currency: "USD",
+    counterparty: "cloudsmith.example",
+    memo: "original",
+    fingerprint: "sha256:" + "9e".repeat(32)
+  });
+  writeFileSync(path, readFileSync(path, "utf8").replace("original", "tampered"));
+  assert.throws(() => new Ledger(path), /ledger integrity check failed/);
 });
 
 test("the pending queue has a ceiling and refuses past it", () => {
@@ -393,12 +520,38 @@ test("webhook_url must be http or https", () => {
   assert.equal(loadConfig(path, join(dir, "data")).webhook_url, "https://hooks.example/x");
 });
 
+test("webhook notifications omit parked arguments and downstream results", () => {
+  const payload = approvalWebhookPayload({
+    approval_id: "a".repeat(32),
+    fingerprint: "sha256:" + "aa".repeat(32),
+    agent_pubkey: AGENT_PUBKEY,
+    amount_minor_units: "100",
+    currency: "USD",
+    counterparty: "cloudsmith.example",
+    memo: "invoice",
+    reason_code: "bridge.pending.ceiling",
+    requested_at: NOON_UTC.toISOString(),
+    status: "granted",
+    call: {
+      tool_name: "create_payment",
+      arguments: { api_key: "must-not-leak", customer_secret: "also-private" }
+    },
+    execution_status: "executed",
+    execution_result: { provider_token: "must-not-leak-either" }
+  });
+  const serialized = JSON.stringify(payload);
+  assert.equal(payload.tool_name, "create_payment");
+  assert.doesNotMatch(serialized, /must-not-leak|also-private/);
+  assert.equal(Object.hasOwn(payload, "memo"), false);
+  assert.equal(Object.hasOwn(payload, "execution_result"), false);
+});
+
 test("env_passthrough controls what a downstream child inherits", () => {
   process.env.BUZZ_AXIRU_TEST_SECRET = "top-secret";
   try {
     const spec = { command: "x", args: [], env: { OWN: "1" }, request_timeout_ms: 1000 };
     assert.equal(childEnv({ ...spec, env_passthrough: "all" }).BUZZ_AXIRU_TEST_SECRET, "top-secret");
-    assert.equal(childEnv(spec).BUZZ_AXIRU_TEST_SECRET, "top-secret");
+    assert.equal(childEnv(spec).BUZZ_AXIRU_TEST_SECRET, undefined, "secure default is no passthrough");
     const none = childEnv({ ...spec, env_passthrough: "none" });
     assert.equal(none.BUZZ_AXIRU_TEST_SECRET, undefined);
     assert.equal(none.OWN, "1");

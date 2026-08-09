@@ -10,7 +10,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { GENESIS_HASH, Ledger, verifyLedger, type LedgerRecord } from "../src/ledger.js";
+import {
+  GENESIS_HASH,
+  historyForAgent,
+  Ledger,
+  verifyLedger,
+  type LedgerRecord
+} from "../src/ledger.js";
 import { AGENT_PUBKEY } from "./helpers.js";
 
 function entry(amount: string, memo: string) {
@@ -121,4 +127,44 @@ test("an empty ledger verifies clean", () => {
   const result = verifyLedger(path);
   assert.equal(result.ok, true);
   assert.equal(result.records, 0);
+});
+
+test("manual reconciliation cannot double-count one approved execution", () => {
+  const path = newLedgerPath();
+  const ledger = new Ledger(path);
+  const base = {
+    type: "execution" as const,
+    actor: "bridge",
+    agent_pubkey: AGENT_PUBKEY,
+    reason_code: "bridge.execution.started",
+    amount_minor_units: "5000",
+    currency: "USD",
+    counterparty: "cloudsmith.example",
+    memo: "approved payment",
+    fingerprint: "sha256:" + "ef".repeat(32),
+    tool_name: "create_payment",
+    approval_id: "a".repeat(32)
+  };
+  const now = new Date("2026-07-21T12:00:00Z");
+  ledger.append({ ...base, execution_status: "in_progress", ts: "2026-07-21T11:58:00Z" });
+  ledger.append({
+    ...base,
+    execution_status: "executed",
+    reason_code: "bridge.execution.ok",
+    ts: "2026-07-21T11:59:00Z"
+  });
+  ledger.append({
+    ...base,
+    actor: "ops-reviewer",
+    execution_status: "executed",
+    reason_code: "bridge.execution.reconciled_executed",
+    ts: now.toISOString()
+  });
+
+  assert.deepEqual(historyForAgent(path, AGENT_PUBKEY, "USD", now), {
+    amount_24h: "5000",
+    amount_30d: "5000",
+    count_24h: 1,
+    count_30d: 1
+  });
 });

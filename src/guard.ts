@@ -24,7 +24,7 @@ import { guardAgentSpend, type GuardReason, type GuardResult } from "@axiru/agen
 
 import { ApprovalStore, isExpired } from "./approvals.js";
 import { isPlausiblePubkey, policiesForAgent, type BridgeConfig } from "./config.js";
-import { historyForAgent, Ledger, type LedgerRecord } from "./ledger.js";
+import { historyForAgent, Ledger, type AgentHistory, type LedgerRecord } from "./ledger.js";
 import { notifyApprovalRequested } from "./notify.js";
 
 export interface SpendRequest {
@@ -121,10 +121,15 @@ export class Bridge {
       );
     }
 
-    const history = historyForAgent(
+    const recordedHistory = historyForAgent(
       this.ledger.filePath,
       request.agent_pubkey,
       this.config.currency,
+      clock
+    );
+    const history = this.withInProgressReservations(
+      recordedHistory,
+      request.agent_pubkey,
       clock
     );
 
@@ -137,11 +142,54 @@ export class Bridge {
         counterparty: { id: request.counterparty },
         timestamp: clock
       },
-      policies: policiesForAgent(this.config, request.agent_pubkey),
+      policies: policiesForAgent(this.config, request.agent_pubkey, history),
       history,
       now: clock
     });
     return { result, clock, currency };
+  }
+
+  /**
+   * An in-progress approved call may already have moved money. Reserve
+   * it in rolling history until an operator records the final outcome,
+   * even when the process died before it could append an execution
+   * record. Double-counting an executed-but-unpersisted response is a
+   * deliberate fail-closed bias; reconciliation clears the reservation.
+   */
+  private withInProgressReservations(
+    recorded: AgentHistory,
+    agentPubkey: string,
+    now: Date
+  ): AgentHistory {
+    const history = { ...recorded };
+    const dayAgo = now.getTime() - 24 * 60 * 60 * 1000;
+    const monthAgo = now.getTime() - 30 * 24 * 60 * 60 * 1000;
+    const capFallback = this.config.controls.per_agent_daily_cap?.cap_minor_units ?? "0";
+    for (const approval of this.approvals.all()) {
+      if (
+        approval.agent_pubkey !== agentPubkey ||
+        approval.currency.toUpperCase() !== this.config.currency ||
+        approval.call === undefined ||
+        approval.execution_status !== "in_progress"
+      ) {
+        continue;
+      }
+      const started = Date.parse(approval.execution_started_at ?? "");
+      const amount = INTEGER_STRING.test(approval.amount_minor_units)
+        ? approval.amount_minor_units
+        : capFallback;
+      // A missing or malformed timestamp is ambiguous, so reserve it in
+      // both windows instead of allowing malformed state to erase spend.
+      if (!Number.isFinite(started) || started >= monthAgo) {
+        history.amount_30d = (BigInt(history.amount_30d) + BigInt(amount)).toString();
+        history.count_30d += 1;
+      }
+      if (!Number.isFinite(started) || started >= dayAgo) {
+        history.amount_24h = (BigInt(history.amount_24h) + BigInt(amount)).toString();
+        history.count_24h += 1;
+      }
+    }
+    return history;
   }
 
   /**
@@ -174,6 +222,32 @@ export class Bridge {
       }
       existing = this.approvals.byFingerprint(result.fingerprint);
     }
+    if (existing && existing.status === "pending") {
+      const record = this.appendDecision(
+        request,
+        currency,
+        "require_approval",
+        existing.reason_code,
+        result.fingerprint,
+        existing.approval_id,
+        clock
+      );
+      return this.decisionResult(request, result.fingerprint, result.decision_id, clock, {
+        decision: "require_approval",
+        reason_code: existing.reason_code,
+        reasons: [
+          {
+            reason_code: existing.reason_code,
+            reason_text: `Approval ${existing.approval_id} is still waiting for a human decision`
+          }
+        ],
+        summary_code: existing.reason_code,
+        approval_id: existing.approval_id,
+        guidance:
+          "This exact intent is already waiting for a human. Do not execute it and do not create another request. Hold until the existing approval is decided.",
+        record
+      });
+    }
     if (existing && existing.status === "expired") {
       const record = this.appendDecision(request, currency, "deny", "bridge.deny.approval_expired", result.fingerprint, existing.approval_id, clock);
       return this.decisionResult(request, result.fingerprint, result.decision_id, clock, {
@@ -193,21 +267,61 @@ export class Bridge {
       });
     }
     if (existing && existing.status === "granted" && !existing.consumed) {
-      this.approvals.consume(existing.approval_id);
-      const record = this.appendDecision(request, currency, "allow", "bridge.allow.human_approved", result.fingerprint, existing.approval_id, clock);
+      // Claim and consume under one store lock. Two simultaneous agent
+      // retries must not both observe the same human grant as unused.
+      const consumed = this.approvals.consumeGranted(existing.approval_id);
+      if (consumed === undefined) {
+        existing = this.approvals.byFingerprint(result.fingerprint);
+      } else {
+        const record = this.appendDecision(
+          request,
+          currency,
+          "allow",
+          "bridge.allow.human_approved",
+          result.fingerprint,
+          existing.approval_id,
+          clock
+        );
+        return this.decisionResult(request, result.fingerprint, result.decision_id, clock, {
+          decision: "allow",
+          reason_code: "bridge.allow.human_approved",
+          reasons: [
+            {
+              reason_code: "bridge.allow.human_approved",
+              reason_text: `Approved by ${existing.decided_by ?? "operator"} (approval ${existing.approval_id}); grant consumed`
+            }
+          ],
+          summary_code: "bridge.allow.human_approved",
+          approval_id: existing.approval_id,
+          guidance:
+            "A human approved this exact intent. The grant is now consumed. Proceed with the payment tool once, then stop.",
+          record
+        });
+      }
+    }
+    if (existing && existing.status === "granted" && existing.consumed) {
+      const record = this.appendDecision(
+        request,
+        currency,
+        "deny",
+        "bridge.deny.approval_already_consumed",
+        result.fingerprint,
+        existing.approval_id,
+        clock
+      );
       return this.decisionResult(request, result.fingerprint, result.decision_id, clock, {
-        decision: "allow",
-        reason_code: "bridge.allow.human_approved",
+        decision: "deny",
+        reason_code: "bridge.deny.approval_already_consumed",
         reasons: [
           {
-            reason_code: "bridge.allow.human_approved",
-            reason_text: `Approved by ${existing.decided_by ?? "operator"} (approval ${existing.approval_id}); grant consumed`
+            reason_code: "bridge.deny.approval_already_consumed",
+            reason_text: `Approval ${existing.approval_id} was already consumed`
           }
         ],
-        summary_code: "bridge.allow.human_approved",
+        summary_code: "bridge.deny.approval_already_consumed",
         approval_id: existing.approval_id,
         guidance:
-          "A human approved this exact intent. The grant is now consumed. Proceed with the payment tool once, then stop.",
+          "The human grant for this exact intent was already consumed. Do not execute or retry it. Use a new business idempotency key and request a new approval only if a second payment is genuinely intended.",
         record
       });
     }

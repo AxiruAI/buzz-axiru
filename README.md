@@ -17,8 +17,9 @@ a payment-class tool:
 - **deny**: the agent gets a structured refusal. Your payment server never
   sees the call.
 - **require_approval**: the call is parked, verbatim. A human approves or
-  denies from the CLI; only a grant makes the gate replay the original call,
-  exactly once.
+  denies from the CLI; only a grant lets the gate durably claim and execute
+  the original call. An ambiguous mid-call failure is held for manual
+  reconciliation instead of being retried into a possible duplicate payment.
 
 Policy evaluation is deterministic and local, with
 [`@axiru/agent-spend-guardrails`](https://www.npmjs.com/package/@axiru/agent-spend-guardrails):
@@ -39,41 +40,67 @@ Goose / Codex / Claude Code  (harnessed by buzz-acp)
         |-- deny  -> structured refusal       (never reaches the server)
         |-- require_approval -> parked call
         |        |-- buzz messages send ...   approval request into your channel
-        |        `-- buzz-axiru approve ----> replayed downstream exactly once
+        |        `-- buzz-axiru approve ----> durable claim -> downstream
         `-- data/ledger.jsonl                 hash-chained decision log
 ```
 
 ## Quickstart
 
-Node 18 or newer. One command from install to a governed agent:
+Node 18 or newer. Generate a secure starter config and wire it to your
+harness:
 
 ```bash
 npm install -g buzz-axiru
-buzz-axiru quickstart
+export BUZZ_AXIRU_AGENT_PUBKEY=<agent's-64-char-hex-pubkey-or-npub>
+buzz-axiru quickstart --harness buzz
 ```
 
 `quickstart` finds your Buzz shell server (`BUZZ_ACP_MCP_COMMAND` first, then
-PATH, then the macOS app bundle), writes a working `policies.json` in the
+PATH, then the macOS app bundle), writes a starter `policies.json` in the
 current directory, and prints the wiring steps for your harness. It never
 prompts: every choice has a flag (`--harness buzz|goose|claude-code|codex`,
-`--force` to overwrite an existing `policies.json`, `--yes` to accept all
-defaults). For Buzz the printed steps boil down to:
+`--agent-pubkey`, `--force` to overwrite an existing `policies.json`, `--yes`
+to accept all defaults). For Buzz the printed steps boil down to:
 
 ```bash
 export BUZZ_ACP_MCP_COMMAND=buzz-axiru
-# restart the agent in Buzz, then prove the gate is up:
-buzz-axiru quickstart --check
+# configure the disabled payment slot, then verify identity, coverage, and connectivity:
+buzz-axiru doctor
 ```
 
-`--check` loads the config, starts every configured downstream server exactly
-the way `serve` does, prints each server with its tool count and which tools
-are gated, and exits 0 on success, 1 on failure.
+`doctor` (also available as `quickstart --check`) loads the config, starts
+every configured downstream server exactly the way `serve` does, lists its
+tools and gate coverage, checks identity and spend controls, and exits 0 only
+when the enforcing setup is ready. Advisory mode, a missing identity, empty
+controls, and a matcher that protects no exposed tools are reported as
+`NOT READY` rather than as a successful install.
 
 The generated config exposes your shell server's tools unchanged and gates
 `pay_*` only. To put a payment server behind the same gate, move the
 ready-made `$downstream_payment_slot` object in `policies.json` into the
 `downstream` array and restart. Details on the multi-server fan-out are in
 [How gating works](#how-gating-works).
+
+The generated file contains no live payment credential. Export each secret in
+the bridge process and name only the variables that its downstream child needs
+in `env_passthrough`.
+
+### Upgrading from 0.3
+
+Version 0.4 intentionally tightens unsafe defaults:
+
+- Gate mode now refuses to start with an empty spend-control set, and refuses
+  a `payment_tools` matcher that gates none of the exposed downstream tools.
+  A missing agent identity is still tolerated (all unattributed agents share
+  the all-zeros pubkey and one daily cap) but is flagged loudly at startup
+  and by `buzz-axiru doctor`.
+- Omitted `env_passthrough` now means `none`, not `all`. Add an explicit
+  allowlist for `PATH` and each credential a child actually needs.
+- New approval ids are 32 hex characters; existing 12-character records are
+  still read and checked against their full fingerprint.
+- `pending` is human-readable by default; use `pending --json` for automation.
+- Ambiguous approved executions remain `in_progress` until an operator uses
+  `reconcile` with provider evidence. They are never retried automatically.
 
 ### Manual setup
 
@@ -91,8 +118,9 @@ Open `policies.json` and fill in two blocks (the file documents itself; the
 ```jsonc
 "downstream": {
   "command": "npx",
-  "args": ["-y", "@stripe/mcp", "--tools=all"],
-  "env": { "STRIPE_SECRET_KEY": "sk_test_..." }
+  "args": ["-y", "@stripe/mcp@<reviewed-exact-version>", "--tools=all"],
+  "env": {},
+  "env_passthrough": ["PATH", "HOME", "TMPDIR", "STRIPE_SECRET_KEY"]
 },
 "payment_tools": {
   "gate": ["create_payment", "refund_*"],
@@ -106,6 +134,16 @@ Open `policies.json` and fill in two blocks (the file documents itself; the
 }
 ```
 
+Keep the key out of `policies.json` and identify the agent before starting.
+Replace `<reviewed-exact-version>` with a pinned release you have reviewed;
+do not launch an unversioned payment server through `npx -y`. Then export:
+
+```bash
+export STRIPE_SECRET_KEY=<your-key>
+export BUZZ_AXIRU_AGENT_PUBKEY=<agent's-64-char-hex-pubkey-or-npub>
+buzz-axiru doctor
+```
+
 Then start it:
 
 ```bash
@@ -117,11 +155,11 @@ Point your agent at `buzz-axiru` instead of the payment server (with buzz-acp:
 payment tools it always did. Now they answer to policy.
 
 Try the scripted session to see a blocked payment, a parked one, and an
-approved replay end to end:
+approved execution end to end:
 
 ```bash
 npm test        # builds and runs the full suite
-npm run demo    # deny, park, approve, replay, verify (DEMO_FAST=1 to skip pauses)
+npm run demo    # deny, park, approve, execute, verify (DEMO_FAST=1 to skip pauses)
 ```
 
 ### Tell your agents (AGENTS.md snippet)
@@ -184,12 +222,17 @@ is why the array example prefixes the payment server with `pay_` and gates
 
 ```jsonc
 "downstream": [
-  { "name": "buzz-dev", "command": "buzz-dev-mcp" },
+  {
+    "name": "buzz-dev",
+    "command": "buzz-dev-mcp",
+    "env_passthrough": ["PATH", "HOME", "TMPDIR"]
+  },
   {
     "name": "payments",
     "command": "npx",
-    "args": ["-y", "@stripe/mcp", "--tools=all"],
-    "env": { "STRIPE_SECRET_KEY": "sk_test_..." },
+    "args": ["-y", "@stripe/mcp@<reviewed-exact-version>", "--tools=all"],
+    "env": {},
+    "env_passthrough": ["PATH", "HOME", "TMPDIR", "STRIPE_SECRET_KEY"],
     "tool_prefix": "pay_"
   }
 ],
@@ -221,7 +264,9 @@ the counterparty allowlist.
 decisions are attributed to `BUZZ_AXIRU_AGENT_PUBKEY` (run one gate per agent,
 as with v0.1) or `agent_pubkey` in the config. If neither is set the gate
 still fails safe: everything attributes to the all-zeros pubkey and all
-unattributed agents share one daily cap.
+unattributed agents share one daily cap. The gate warns loudly at startup and
+`buzz-axiru doctor` reports the missing identity as `NOT READY`; set one per
+gate before production.
 
 ## Approvals
 
@@ -230,17 +275,35 @@ the details to your Buzz channel (agent pubkey, amount, counterparty, reason
 code, approval id), and returns `pending_approval` to the agent. Then:
 
 ```bash
-buzz-axiru pending                     # see what is waiting
-buzz-axiru approve 9c77edc5e275 --by marcos --note "invoice checked"
-buzz-axiru deny 9c77edc5e275 --by marcos --note "wrong vendor"
+buzz-axiru pending                                  # concise waiting list
+buzz-axiru show 9c77edc5e275174850812007ed184b62    # exact parked arguments
+buzz-axiru approve 9c77edc5e275174850812007ed184b62 --by marcos --note "invoice checked"
+buzz-axiru deny 9c77edc5e275174850812007ed184b62 --by marcos --note "wrong vendor"
 ```
 
-On a grant, the running gate process replays the original call against the
-downstream server exactly once and records the outcome. The agent's next
-identical call returns the stored result (with an `_buzz_axiru` annotation),
-never a second payment. If the downstream call fails after approval, that is
-recorded with its own status (`execution_failed_after_approval`) and the grant
-is spent; a human has to look.
+If Axiru cannot extract an amount, `show` makes the exact call visible and
+`approve` additionally requires `--ack-unknown-amount`; a bare approval is
+refused.
+
+On a grant, the gate atomically records an `in_progress` claim on disk before
+sending the parked call downstream. A successful result is stored, and the
+agent's next identical call returns it with an `_buzz_axiru` annotation. This
+provides durable **at-most-once** execution across retries, concurrent gate
+instances, and restarts. It deliberately does not claim impossible
+exactly-once semantics: if the process dies after the claim but before it can
+record the provider's response, Axiru will not retry automatically. The
+approval stays `in_progress`, reserves its policy-currency amount against
+rolling history, and an operator must check the payment provider. Record the
+verified outcome with evidence:
+
+```bash
+buzz-axiru reconcile 9c77edc5e275174850812007ed184b62 \
+  --outcome executed --by marcos --note "provider payment pi_123 succeeded"
+# or: --outcome failed --note "provider search confirms no transfer"
+```
+
+A known downstream failure is recorded as `failed`; the grant remains spent
+and requires human review before a genuinely new payment is requested.
 
 Approvals expire: `approval_ttl_seconds` (default 24 hours). An expired
 approval can no longer be granted, is never executed, and is recorded in the
@@ -251,7 +314,9 @@ fingerprint of the exact call.
 Approving by replying in the channel is not implemented: that requires the
 bridge to hold a relay subscription, and it is left as a marked integration
 point (`src/notify.ts`). A `webhook_url` receives approval requests and
-outcomes for operators who want them in their own tooling.
+outcomes for operators who want them in their own tooling. Webhook bodies are
+summary-only: exact tool arguments and provider results remain local because
+they may contain credentials or customer/payment data.
 
 ## Policies
 
@@ -259,14 +324,18 @@ Policies load from `policies.json` at startup. The default pack:
 
 | control | default | effect |
 |---|---|---|
-| `per_agent_daily_cap` | USD 100,000.00 per 24h | deny once the agent's trailing-24h spend hits the cap |
+| `per_agent_daily_cap` | USD 100,000.00 per 24h | deny a request that would push trailing-24h spend over the cap |
 | `single_payment_ceiling` | USD 25,000.00 | any single payment at or above it requires human approval |
 | `counterparty_allowlist` | 3 example ids | anything not listed is denied |
 | `business_hours` | 09:00 to 17:00 America/New_York | outside the window, spend requires human approval |
 
-The daily cap is instantiated per requesting pubkey. Rolling-window history
-comes from the bridge's own ledger: in gate mode, executed downstream calls
-count; in advisory mode, allow decisions count.
+The daily cap is instantiated per requesting pubkey and includes the current
+request: reaching the cap exactly is allowed, crossing it is denied.
+Rolling-window history comes from the bridge's own ledger: in gate mode,
+executed downstream calls count; in advisory mode, allow decisions count.
+One gate evaluates one configured currency. A call whose extracted currency
+does not match the policy currency is never executed; run separate gate
+instances for independently denominated policy packs.
 
 ## The decision ledger
 
@@ -280,6 +349,11 @@ or deleting any record breaks every hash after it:
 buzz-axiru verify
 # { "ok": true, "records": 5, "head_hash": "d0723de2..." }
 ```
+
+The chain is verified when the ledger opens and again before every append; a
+corrupt chain blocks new decisions instead of being extended. Local config,
+approval, ledger, and lock files are created owner-only (`0600`) and data
+directories as `0700`.
 
 One honest caveat: truncating the tail of a local file is not detectable from
 the file alone. If you need that property, anchor the current `head_hash`
@@ -364,7 +438,7 @@ Read this section before trusting the gate with anything.
   payment tool missing from `payment_tools.gate` passes through ungated
   (unless you omit the matcher entirely, in which case everything is gated).
   Review the downstream server's tool list when you configure it, and again
-  when you upgrade it. The gate warns at startup when a configured matcher
+  when you upgrade it. The gate refuses to start when a configured matcher
   gates none of the tools it can see. Note also that gate patterns match the
   exposed tool name, and without a `tool_prefix` that name is chosen by the
   downstream server: a server that renames its payment tool leaves the gate.
@@ -375,24 +449,33 @@ Read this section before trusting the gate with anything.
   process and the approve/deny CLI interleave writes safely, because every
   ledger append and every approval-store update is taken under an exclusive
   lock on the data directory (`<data_dir>/.lock`). A writer that cannot take
-  that lock within ten seconds fails loudly rather than writing anyway. Point
-  two bridges at one data directory and they will serialize, not corrupt each
-  other, but they will also contend.
+  that lock within ten seconds fails loudly rather than writing anyway. Run
+  only one serving gate process per data directory: writers serialize safely,
+  but policy evaluation and a downstream side effect are not one cross-process
+  transaction, so two serving processes could both authorize against the same
+  pre-payment cap history. The approve/deny/reconcile CLI may safely share the
+  serving process's data directory.
 - In gate mode the agent identity comes from the operator's configuration
   (`BUZZ_AXIRU_AGENT_PUBKEY` per instance), not from anything the agent
   proves cryptographically. In advisory mode `agent_pubkey` is self-reported
   by the calling agent; pin it per instance.
-- Approved-then-executed calls are replayed exactly as parked. If the
-  downstream server treats a replay differently over time (price changes,
-  idempotency windows), the human should approve promptly; the TTL exists to
-  keep stale intents from executing.
+- Approved calls execute with the exact arguments that were parked. If the
+  downstream server interprets those arguments differently over time (for
+  example, a price quote changes), approve promptly; the TTL exists to keep
+  stale intents from executing.
+- At-most-once claims apply to human-approved parked calls. A direct policy
+  `allow` is passed through immediately and has no durable retry deduplication.
+  Use a provider-supported idempotency key for every money-moving tool so an
+  agent or transport retry cannot duplicate a directly allowed payment.
+- Each process has one policy currency. Currency mismatch fails closed; use a
+  separate gate and ledger for each independently denominated policy pack.
 - The ledger is tamper-EVIDENT, not tamper-PROOF. `buzz-axiru verify`
   re-derives the whole chain and names the first bad record, so an edit, a
   reorder, a deletion, or a mid-file truncation is caught. It cannot catch
   anyone who can write `data_dir`, because that person can recompute a
   consistent chain from genesis, and it cannot by itself catch a truncation
-  of the tail. Copy the head hash somewhere the agent cannot write (the Buzz
-  channel post already carries one per decision) if you need either.
+  of the tail. Copy the head hash somewhere the agent cannot write if you need
+  either; the local bridge does not automate external anchoring.
 - Business-hours policy knows hours and timezones, not weekends or holidays.
 - The channel-post adapter shells out to the `buzz` CLI; if the CLI is absent
   or the relay is down, the approval still exists locally and is listed by
@@ -400,18 +483,24 @@ Read this section before trusting the gate with anything.
   argv array and no shell, and every agent-supplied field in the message
   (memo, counterparty, amounts) is flattened to one line first, so an agent
   cannot forge extra lines in what the approver reads.
-- Downstream children inherit the bridge's full environment by default, which
-  includes `BUZZ_PRIVATE_KEY` and any other server's API keys. Set
-  `"env_passthrough": "none"` (or a list of variable names) per downstream
-  entry to narrow that. The default is unchanged from 0.2 so upgrades do not
-  break, but it is the wrong default for a multi-server setup.
+- Downstream children inherit no bridge environment variables by default.
+  Use an explicit `env_passthrough` allowlist for variables a child needs.
+  Legacy `"all"` remains supported, but exposes `BUZZ_PRIVATE_KEY` and every
+  unrelated credential in the bridge process and produces a readiness warning.
 - The pending-approval queue is bounded by `max_pending_approvals` (default
   500). At the ceiling, gated calls are refused with
   `bridge.deny.approval_queue_full` rather than parked, because an agent that
   varies its arguments otherwise chooses how long the queue gets.
+- Decided approval records are retained in `approvals.json` so identical
+  retries remain sticky. That file can grow over time and may contain exact
+  call arguments and provider results; archive it only with an operator-defined
+  retention process that preserves the ledger and idempotency requirements.
 - If the downstream server crashes, gated and passthrough calls return
   errors (never hang) and the child is not auto-restarted; restart the
   bridge.
+
+For the deployment threat model, reporting instructions, and a production
+checklist, read [SECURITY.md](SECURITY.md).
 
 ## Development notes
 

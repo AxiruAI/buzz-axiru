@@ -1,6 +1,6 @@
 {
   "name": "buzz-axiru",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Bounded spend authority for Buzz agents. A gating MCP proxy in front of your payment MCP server: policy evaluation before money moves, human approvals in the Buzz channel, and a hash-chained decision log keyed to the agent's Nostr pubkey.",
   "license": "Apache-2.0",
   "type": "module",
@@ -39,6 +39,7 @@
     "dist/src",
     "policies.json",
     "README.md",
+    "SECURITY.md",
     "LICENSE"
   ],
   "engines": {
@@ -46,6 +47,7 @@
   },
   "scripts": {
     "build": "tsc -p vendor/agent-spend-guardrails/tsconfig.json && tsc -p tsconfig.json",
+    "prepack": "npm run build",
     "test": "npm run build && node --test dist/test/*.test.js",
     "demo": "npm run build && node dist/demo/demo.js",
     "verify": "node dist/src/cli.js verify"
@@ -54,7 +56,7 @@
     "@axiru/agent-spend-guardrails": "file:vendor/agent-spend-guardrails"
   },
   "devDependencies": {
-    "@types/node": "^22.10.0",
-    "typescript": "^5.6.3"
+    "@types/node": "22.20.1",
+    "typescript": "5.9.3"
   }
 }

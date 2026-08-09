@@ -48,6 +48,7 @@ export const STARTER_POLICIES = `{
       "command": "buzz-dev-mcp",
       "args": [],
       "env": {},
+      "env_passthrough": ["PATH", "HOME", "TMPDIR"],
       "request_timeout_ms": 30000,
       "hide_tools": []
     },
@@ -55,10 +56,10 @@ export const STARTER_POLICIES = `{
       "$comment": "The payment server, prefixed so shell tools keep their plain names and the gate patterns can target money tools only.",
       "name": "payments",
       "command": "npx",
-      "args": ["-y", "@stripe/mcp", "--tools=all"],
-      "env": { "STRIPE_SECRET_KEY": "sk_test_..." },
-      "env_passthrough": "none",
-      "$env_passthrough_comment": "Which of the bridge's own environment variables this child inherits: all (the default, and what every version before 0.3 did), none, or a list of variable names. Passing everything hands this server the bridge's BUZZ_PRIVATE_KEY and every other server's API keys, so narrow it when you run more than one downstream server.",
+      "args": ["-y", "@stripe/mcp@PIN_REVIEWED_VERSION", "--tools=all"],
+      "env": {},
+      "env_passthrough": ["PATH", "HOME", "TMPDIR", "STRIPE_SECRET_KEY"],
+      "$env_passthrough_comment": "Replace PIN_REVIEWED_VERSION with an exact package version you reviewed; never run an unpinned payment server via npx. Only these variables reach the payment server. Export STRIPE_SECRET_KEY in the bridge environment instead of writing a live secret into this file. Omitted env_passthrough defaults to none; all is available for legacy setups but exposes the bridge signing key and unrelated credentials.",
       "tool_prefix": "pay_",
       "request_timeout_ms": 30000,
       "hide_tools": []
@@ -89,7 +90,7 @@ export const STARTER_POLICIES = `{
   "$max_pending_comment": "Ceiling on approvals waiting on a human at once. The agent picks the tool arguments, so the agent picks how many distinct approvals exist; past this ceiling gated calls are refused outright rather than growing a queue nobody will read. null disables the ceiling (not recommended).",
 
   "agent_pubkey": null,
-  "$agent_pubkey_comment": "The Nostr pubkey (64-char hex) decisions are attributed to in gate mode. Usually set per instance via BUZZ_AXIRU_AGENT_PUBKEY instead. If neither is set, decisions attribute to the all-zeros pubkey and all unattributed agents share one daily cap.",
+  "$agent_pubkey_comment": "The Nostr pubkey (64-char hex or npub) decisions are attributed to in gate mode. Usually set per instance via BUZZ_AXIRU_AGENT_PUBKEY instead. If neither is set, decisions attribute to the all-zeros pubkey and all unattributed agents share one daily cap; buzz-axiru doctor reports this as not ready.",
 
   "buzz": {
     "$comment": "Set channel_id to a Buzz channel UUID to post approval requests there via the buzz CLI. The CLI must be on PATH and BUZZ_PRIVATE_KEY / BUZZ_RELAY_URL must be set for the bridge's own identity.",

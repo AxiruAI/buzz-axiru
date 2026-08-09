@@ -20,7 +20,17 @@
  * Licensed under the Apache License, Version 2.0.
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  writeFileSync
+} from "node:fs";
 import { dirname, join } from "node:path";
 
 import { withDataDirLock } from "./lock.js";
@@ -45,7 +55,7 @@ export class ApprovalQueueFullError extends Error {
   }
 }
 
-/** A gated downstream tool call, parked verbatim for replay on approval. */
+/** A gated downstream tool call, parked verbatim for execution on approval. */
 export interface ParkedCall {
   tool_name: string;
   arguments: Record<string, unknown>;
@@ -69,10 +79,17 @@ export interface ApprovalRequest {
   consumed?: boolean;
   /** When this approval stops being decidable (ISO). Absent = no expiry. */
   expires_at?: string;
-  /** Gate mode: the original tool call to replay after a grant. */
+  /** Gate mode: the original tool call to execute after a grant. */
   call?: ParkedCall;
-  /** Gate mode: outcome of the replay against the downstream server. */
-  execution_status?: "executed" | "failed";
+  /**
+   * Gate-mode execution status. `in_progress` is a durable,
+   * pre-execution claim. Once written, a
+   * restarted or second gate must never retry the call automatically:
+   * the downstream may already have moved money even if the process
+   * died before it could record the response.
+   */
+  execution_status?: "in_progress" | "executed" | "failed";
+  execution_started_at?: string;
   executed_at?: string;
   /** The downstream tools/call result, stored for idempotent re-reads. */
   execution_result?: unknown;
@@ -111,6 +128,82 @@ export function isExpired(approval: ApprovalRequest, now: Date): boolean {
   return Number.isFinite(at) && now.getTime() >= at;
 }
 
+type ApprovalMap = Record<string, ApprovalRequest>;
+
+function emptyApprovalMap(): ApprovalMap {
+  return Object.create(null) as ApprovalMap;
+}
+
+const APPROVAL_STATUSES = new Set<ApprovalStatus>(["pending", "granted", "denied", "expired"]);
+const EXECUTION_STATUSES = new Set(["in_progress", "executed", "failed"]);
+const FINGERPRINT = /^sha256:[0-9a-f]{64}$/;
+
+/**
+ * The approval store controls whether a parked payment may execute, so
+ * malformed state must stop the gate rather than be interpreted as an
+ * empty queue. This is intentionally stricter than a best-effort cache.
+ */
+function approvalProblem(key: string, value: unknown): string | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return `record "${key}" is not an object`;
+  }
+  const approval = value as Partial<ApprovalRequest>;
+  if (approval.approval_id !== key) return `record "${key}" has a mismatched approval_id`;
+  if (typeof approval.fingerprint !== "string" || !FINGERPRINT.test(approval.fingerprint)) {
+    return `record "${key}" has an invalid fingerprint`;
+  }
+  if (!APPROVAL_STATUSES.has(approval.status as ApprovalStatus)) {
+    return `record "${key}" has an invalid status`;
+  }
+  for (const field of [
+    "agent_pubkey",
+    "amount_minor_units",
+    "currency",
+    "counterparty",
+    "memo",
+    "reason_code",
+    "requested_at"
+  ] as const) {
+    if (typeof approval[field] !== "string") return `record "${key}" is missing ${field}`;
+  }
+  if (
+    approval.execution_status !== undefined &&
+    !EXECUTION_STATUSES.has(approval.execution_status)
+  ) {
+    return `record "${key}" has an invalid execution_status`;
+  }
+  if (approval.call !== undefined) {
+    if (
+      typeof approval.call !== "object" ||
+      approval.call === null ||
+      typeof approval.call.tool_name !== "string" ||
+      typeof approval.call.arguments !== "object" ||
+      approval.call.arguments === null ||
+      Array.isArray(approval.call.arguments)
+    ) {
+      return `record "${key}" has an invalid parked call`;
+    }
+  }
+  return null;
+}
+
+function own(all: ApprovalMap, id: string): ApprovalRequest | undefined {
+  return Object.prototype.hasOwnProperty.call(all, id) ? all[id] : undefined;
+}
+
+/** Resolve an exact fingerprint, including a pre-0.3 short-key record. */
+function recordForFingerprint(all: ApprovalMap, fingerprint: string): ApprovalRequest | undefined {
+  const current = own(all, approvalIdForFingerprint(fingerprint));
+  if (current?.fingerprint === fingerprint) return current;
+  const legacy = own(all, legacyApprovalIdForFingerprint(fingerprint));
+  return legacy?.fingerprint === fingerprint ? legacy : undefined;
+}
+
+export interface ExecutionClaim {
+  claimed: boolean;
+  approval: ApprovalRequest;
+}
+
 export class ApprovalStore {
   readonly filePath: string;
   private readonly dataDir: string;
@@ -125,27 +218,58 @@ export class ApprovalStore {
     return withDataDirLock(this.dataDir, fn);
   }
 
-  private load(): Record<string, ApprovalRequest> {
-    if (!existsSync(this.filePath)) return {};
+  private load(): ApprovalMap {
+    if (!existsSync(this.filePath)) return emptyApprovalMap();
+    let parsed: unknown;
     try {
-      return JSON.parse(readFileSync(this.filePath, "utf8")) as Record<string, ApprovalRequest>;
-    } catch {
-      return {};
+      parsed = JSON.parse(readFileSync(this.filePath, "utf8"));
+    } catch (err) {
+      throw new Error(
+        `buzz-axiru: cannot read approval store ${this.filePath}: ${(err as Error).message}. ` +
+          "Refusing to forget approval state because that could re-authorize a payment."
+      );
     }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new Error(`buzz-axiru: approval store ${this.filePath} must contain a JSON object`);
+    }
+    const all = emptyApprovalMap();
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+      const problem = approvalProblem(key, value);
+      if (problem !== null) {
+        throw new Error(
+          `buzz-axiru: approval store ${this.filePath} is invalid: ${problem}. ` +
+            "Refusing to continue with ambiguous payment state."
+        );
+      }
+      all[key] = value as ApprovalRequest;
+    }
+    return all;
   }
 
-  private save(all: Record<string, ApprovalRequest>): void {
-    mkdirSync(dirname(this.filePath), { recursive: true });
+  private save(all: ApprovalMap): void {
+    const directory = dirname(this.filePath);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
     // The temp name carries the pid so that a writer running without
     // the lock (a future caller, a bug) cannot truncate another
     // writer's staging file mid-write.
     const tmp = `${this.filePath}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify(all, null, 2) + "\n", "utf8");
+    writeFileSync(tmp, JSON.stringify(all, null, 2) + "\n", {
+      encoding: "utf8",
+      mode: 0o600
+    });
+    chmodSync(tmp, 0o600);
+    const fd = openSync(tmp, "r");
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
     renameSync(tmp, this.filePath);
+    fsyncDirectory(directory);
   }
 
   get(approvalId: string): ApprovalRequest | undefined {
-    return this.load()[approvalId];
+    return own(this.load(), approvalId);
   }
 
   byFingerprint(fingerprint: string): ApprovalRequest | undefined {
@@ -153,7 +277,7 @@ export class ApprovalStore {
     // Stores written before the id was widened key the same intent
     // under its short id; keep honouring those so an upgrade does not
     // orphan a pending approval a human is about to decide.
-    return all[approvalIdForFingerprint(fingerprint)] ?? all[legacyApprovalIdForFingerprint(fingerprint)];
+    return recordForFingerprint(all, fingerprint);
   }
 
   pending(): ApprovalRequest[] {
@@ -180,10 +304,16 @@ export class ApprovalStore {
   ): ApprovalRequest {
     const all = this.load();
     const id = approvalIdForFingerprint(request.fingerprint);
-    const existing = all[id] ?? all[legacyApprovalIdForFingerprint(request.fingerprint)];
+    const existing = recordForFingerprint(all, request.fingerprint);
     // A repeat of an intent that is already parked is not queue growth,
     // so the ceiling only applies to genuinely new records.
     if (existing) return existing;
+    const colliding = own(all, id);
+    if (colliding !== undefined) {
+      throw new Error(
+        `buzz-axiru: approval id collision for ${id}; refusing to merge two different payment intents`
+      );
+    }
     if (maxPending !== null) {
       const pendingNow = Object.values(all).filter(
         (a) => a.status === "pending" && !isExpired(a, now)
@@ -209,30 +339,30 @@ export class ApprovalStore {
     now: Date = new Date()
   ): ApprovalRequest {
     return this.locked(() => {
-    const all = this.load();
-    const approval = all[approvalId];
-    if (!approval) {
-      throw new Error(`buzz-axiru: no approval with id ${approvalId}`);
-    }
-    if (approval.status === "pending" && isExpired(approval, now)) {
-      approval.status = "expired";
+      const all = this.load();
+      const approval = own(all, approvalId);
+      if (!approval) {
+        throw new Error(`buzz-axiru: no approval with id ${approvalId}`);
+      }
+      if (approval.status === "pending" && isExpired(approval, now)) {
+        approval.status = "expired";
+        this.save(all);
+        throw new Error(
+          `buzz-axiru: approval ${approvalId} expired at ${approval.expires_at} and can no longer be ${status}`
+        );
+      }
+      if (approval.status !== "pending") {
+        throw new Error(
+          `buzz-axiru: approval ${approvalId} was already ${approval.status}` +
+            (approval.decided_by !== undefined ? ` by ${approval.decided_by}` : "")
+        );
+      }
+      approval.status = status;
+      approval.decided_by = decidedBy;
+      approval.decided_at = now.toISOString();
+      if (note !== undefined) approval.note = note;
       this.save(all);
-      throw new Error(
-        `buzz-axiru: approval ${approvalId} expired at ${approval.expires_at} and can no longer be ${status}`
-      );
-    }
-    if (approval.status !== "pending") {
-      throw new Error(
-        `buzz-axiru: approval ${approvalId} was already ${approval.status}` +
-          (approval.decided_by !== undefined ? ` by ${approval.decided_by}` : "")
-      );
-    }
-    approval.status = status;
-    approval.decided_by = decidedBy;
-    approval.decided_at = now.toISOString();
-    if (note !== undefined) approval.note = note;
-    this.save(all);
-    return approval;
+      return approval;
     });
   }
 
@@ -244,7 +374,7 @@ export class ApprovalStore {
   markExpired(approvalId: string, now: Date = new Date()): ApprovalRequest | undefined {
     return this.locked(() => {
       const all = this.load();
-      const approval = all[approvalId];
+      const approval = own(all, approvalId);
       if (!approval || approval.status !== "pending" || !isExpired(approval, now)) {
         return undefined;
       }
@@ -254,7 +384,7 @@ export class ApprovalStore {
     });
   }
 
-  /** Record the downstream replay outcome for a granted parked call. */
+  /** Record the downstream execution outcome for a granted parked call. */
   recordExecution(
     approvalId: string,
     outcome:
@@ -262,33 +392,84 @@ export class ApprovalStore {
       | { status: "failed"; error: string; at: Date }
   ): ApprovalRequest {
     return this.locked(() => {
-    const all = this.load();
-    const approval = all[approvalId];
-    if (!approval) {
-      throw new Error(`buzz-axiru: no approval with id ${approvalId}`);
-    }
-    approval.execution_status = outcome.status;
-    approval.executed_at = outcome.at.toISOString();
-    if (outcome.status === "executed") {
-      approval.execution_result = outcome.result;
-    } else {
-      approval.execution_error = outcome.error;
-    }
-    approval.consumed = true;
-    this.save(all);
-    return approval;
+      const all = this.load();
+      const approval = own(all, approvalId);
+      if (!approval) {
+        throw new Error(`buzz-axiru: no approval with id ${approvalId}`);
+      }
+      if (approval.status !== "granted" || approval.execution_status !== "in_progress") {
+        throw new Error(
+          `buzz-axiru: approval ${approvalId} has no active execution claim; refusing to overwrite its outcome`
+        );
+      }
+      approval.execution_status = outcome.status;
+      approval.executed_at = outcome.at.toISOString();
+      if (outcome.status === "executed") {
+        approval.execution_result = outcome.result;
+      } else {
+        approval.execution_error = outcome.error;
+      }
+      approval.consumed = true;
+      this.save(all);
+      return approval;
     });
   }
 
-  /** Mark a granted approval as used so it cannot authorize a second transfer. */
-  consume(approvalId: string): void {
-    this.locked(() => {
+  /**
+   * Atomically consume an advisory-mode grant. Exactly one concurrent
+   * caller receives the record; every later caller receives undefined.
+   */
+  consumeGranted(approvalId: string): ApprovalRequest | undefined {
+    return this.locked(() => {
       const all = this.load();
-      const approval = all[approvalId];
-      if (approval && approval.status === "granted") {
-        approval.consumed = true;
-        this.save(all);
-      }
+      const approval = own(all, approvalId);
+      if (!approval || approval.status !== "granted" || approval.consumed === true) return undefined;
+      approval.consumed = true;
+      this.save(all);
+      return approval;
     });
+  }
+
+  /**
+   * Claim a parked call before touching the downstream server. This is
+   * the durable at-most-once boundary: if the process crashes after the
+   * claim, a restart leaves the call in_progress for manual
+   * reconciliation instead of risking a duplicate payment.
+   */
+  claimExecution(approvalId: string, now: Date = new Date()): ExecutionClaim {
+    return this.locked(() => {
+      const all = this.load();
+      const approval = own(all, approvalId);
+      if (!approval) throw new Error(`buzz-axiru: no approval with id ${approvalId}`);
+      if (
+        approval.status !== "granted" ||
+        approval.call === undefined ||
+        approval.execution_status !== undefined
+      ) {
+        return { claimed: false, approval };
+      }
+      approval.execution_status = "in_progress";
+      approval.execution_started_at = now.toISOString();
+      approval.consumed = true;
+      this.save(all);
+      return { claimed: true, approval };
+    });
+  }
+}
+
+/** Persist a rename's directory entry where the platform supports it. */
+function fsyncDirectory(path: string): void {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, "r");
+    fsyncSync(fd);
+  } catch (err) {
+    // Windows and some network filesystems do not permit fsync on a
+    // directory. The file itself is already flushed; do not turn a
+    // portability limitation into an approval-store outage.
+    const code = (err as NodeJS.ErrnoException).code;
+    if (process.platform !== "win32" && code !== "EINVAL" && code !== "ENOTSUP") throw err;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
   }
 }

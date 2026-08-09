@@ -9,8 +9,9 @@
  *   deny             -> a structured refusal; the downstream server
  *                       never sees the call
  *   require_approval -> the call is parked verbatim; a human grants
- *                       or denies it (CLI), and only a grant makes
- *                       the gate replay the original call downstream
+ *                       or denies it (CLI), and only a grant lets the
+ *                       gate durably claim and execute the original
+ *                       call downstream
  *
  * Fail-closed choices, all deliberate:
  *   - downstream configured but no payment_tools matcher: EVERY
@@ -24,7 +25,7 @@
  * Approvals for gated calls are keyed to a CALL fingerprint
  * (tool name + full arguments + agent pubkey), not just the policy
  * intent fingerprint: a grant authorizes exactly the bytes the human
- * saw, and replaying an identical call after execution returns the
+ * saw, and retrying an identical call after execution returns the
  * stored downstream result instead of paying twice.
  *
  * Licensed under the Apache License, Version 2.0.
@@ -33,12 +34,13 @@
 import { sha256Fingerprint } from "@axiru/agent-spend-guardrails";
 
 import { ApprovalQueueFullError, isExpired, type ApprovalRequest } from "./approvals.js";
-import { extractPayment, isGatedTool, type BridgeConfig } from "./config.js";
+import { extractPayment, isGatedTool, policiesForAgent, type BridgeConfig } from "./config.js";
 import { DownstreamError, type DownstreamTool } from "./downstream.js";
 import { DownstreamPool } from "./pool.js";
 import type { Bridge, SpendRequest } from "./guard.js";
 import {
   errorResponse,
+  isJsonObject,
   jsonShapeProblem,
   LATEST_PROTOCOL_VERSION,
   response,
@@ -87,7 +89,7 @@ export class GateServer {
   private downstreamTools: DownstreamTool[] = [];
   private readonly clock: () => Date;
   private readonly quiet: boolean;
-  /** In-flight approval executions, to prevent a poller/retry double-replay. */
+  /** In-flight approval executions, to prevent a poller/retry double-execution. */
   private readonly executing = new Set<string>();
   readonly agentPubkey: string;
   /** True when the matcher config is missing and every tool is gated. */
@@ -107,6 +109,17 @@ export class GateServer {
     this.gateAll = config.payment_tools === null;
     this.agentPubkey =
       process.env.BUZZ_AXIRU_AGENT_PUBKEY ?? config.agent_pubkey ?? UNATTRIBUTED_PUBKEY;
+    // FAIL CLOSED: with zero spend controls the policy engine has
+    // nothing to deny with, so every mapped payment call would execute
+    // immediately while the operator believes a gate is in place. A
+    // gate that gates nothing is worse than no gate, because it looks
+    // like one.
+    if (policiesForAgent(config, this.agentPubkey).length === 0) {
+      throw new Error(
+        "buzz-axiru: gate mode requires at least one spend control. Configure a daily cap, " +
+          "single-payment approval threshold, counterparty allowlist, business hours, or velocity cap."
+      );
+    }
     this.downstream = new DownstreamPool(config.downstream);
   }
 
@@ -118,10 +131,25 @@ export class GateServer {
   async start(): Promise<void> {
     await this.downstream.start(LATEST_PROTOCOL_VERSION, this.version);
     this.downstreamTools = await this.downstream.listTools();
+    const gated = this.downstreamTools
+      .map((tool) => tool.name)
+      .filter((name) => this.isGated(name));
+    // The fail-closed rule only covers a MISSING matcher. Once
+    // payment_tools is set it is an allowlist of gated names, and a
+    // matcher that matches nothing gates nothing: every tool, any
+    // money-movers included, would pass straight through a gate the
+    // operator believes is enforcing. Refuse to start instead; a
+    // startup warning on a background MCP server's stderr is a warning
+    // nobody reads.
+    if (!this.gateAll && gated.length === 0) {
+      this.downstream.close();
+      throw new Error(
+        "buzz-axiru: payment_tools is configured, but no exposed downstream tool matches " +
+          "any gate pattern. Refusing to start an enforcing gate that protects nothing. " +
+          "Run `buzz-axiru doctor` and fix payment_tools.gate."
+      );
+    }
     if (!this.quiet) {
-      const gated = this.downstreamTools
-        .map((t) => t.name)
-        .filter((name) => this.isGated(name));
       const perServer = this.downstream.servers
         .map((server) => {
           const count = this.downstreamTools.filter(
@@ -143,18 +171,10 @@ export class GateServer {
             "that move money.\n"
         );
       }
-      // The fail-closed rule only covers a MISSING matcher. Once
-      // payment_tools is set it is an allowlist of gated names, and a
-      // money tool the operator did not list passes straight through.
-      // Two shapes of that mistake are worth shouting about at startup.
-      if (!this.gateAll && gated.length === 0) {
-        process.stderr.write(
-          "buzz-axiru gate: WARNING: payment_tools is configured but NOT ONE of the " +
-            `${this.downstreamTools.length} downstream tools matches a gate pattern. ` +
-            "Nothing is being gated: every tool, including any that moves money, passes " +
-            "straight through. Check payment_tools.gate against the tool names above.\n"
-        );
-      }
+      // A zero-match matcher is refused above; a partial matcher is
+      // still operator-defined, and a money tool the operator did not
+      // list passes straight through. Stable prefixes remain the
+      // safest boundary, so that mistake is worth a startup note.
       if (!this.gateAll) {
         const unprefixed = this.downstream.servers
           .filter((server) => server.tool_prefix === "")
@@ -175,10 +195,10 @@ export class GateServer {
             "to the all-zeros pubkey, so all unattributed agents share one daily cap.\n"
         );
       }
-      // One line, once, because the default is convenient and lossy:
-      // every downstream child sees the bridge's own signing key.
+      // Legacy configs can still explicitly request this lossy mode:
+      // every downstream child then sees the bridge's own signing key.
       const inheriting = this.downstream.servers.filter(
-        (server) => (server.env_passthrough ?? "all") === "all"
+        (server) => server.env_passthrough === "all"
       );
       if (inheriting.length > 0 && process.env.BUZZ_PRIVATE_KEY !== undefined) {
         process.stderr.write(
@@ -221,9 +241,17 @@ export class GateServer {
   private async dispatch(raw: string): Promise<string | null> {
     let message: JsonRpcRequest;
     try {
-      message = JSON.parse(raw) as JsonRpcRequest;
+      const parsed = JSON.parse(raw) as unknown;
+      if (!isJsonObject(parsed)) return errorResponse(null, -32600, "Invalid Request: expected an object");
+      message = parsed as unknown as JsonRpcRequest;
     } catch {
       return errorResponse(null, -32700, "Parse error: not valid JSON");
+    }
+    if (message.jsonrpc !== "2.0" || typeof message.method !== "string") {
+      return errorResponse(null, -32600, "Invalid Request: expected jsonrpc \"2.0\" and a method");
+    }
+    if (message.params !== undefined && !isJsonObject(message.params)) {
+      return errorResponse(message.id ?? null, -32602, "Invalid params: expected an object");
     }
     const id = message.id ?? null;
     const isNotification = message.id === undefined;
@@ -306,10 +334,14 @@ export class GateServer {
     params: Record<string, unknown>
   ): Promise<string> {
     const name = params.name;
-    const args = (params.arguments ?? {}) as Record<string, unknown>;
+    const rawArgs = params.arguments ?? {};
     if (typeof name !== "string") {
       return errorResponse(id, -32602, "tools/call requires a tool name");
     }
+    if (!isJsonObject(rawArgs)) {
+      return errorResponse(id, -32602, "tools/call arguments must be an object");
+    }
+    const args = rawArgs;
     // Checked before anything walks the arguments: the fingerprint,
     // the memo, and the policy evaluator all recurse over this object.
     const shapeProblem = jsonShapeProblem(args);
@@ -393,7 +425,11 @@ export class GateServer {
     }
 
     const extraction = extractPayment(this.config, name, args);
-    const memo = `${name} ${JSON.stringify(args).slice(0, 160)}`;
+    // Approval files retain the exact arguments for local inspection
+    // (`buzz-axiru show <id>`). Ledger memos and notification summaries
+    // must not echo arbitrary argument fields: payment calls often
+    // carry API tokens, customer secrets, or PII.
+    const memo = `Gated call to ${name}`;
 
     if (!extraction.ok) {
       // FAIL CLOSED: an amount the gate cannot read is a payment a
@@ -573,9 +609,9 @@ export class GateServer {
         );
       case "granted": {
         if (existing.execution_status === undefined) {
-          // Granted but the poller has not replayed it yet: replay now.
-          const replayed = await this.executeApproved(existing, now);
-          return this.approvedOutcomeResponse(id, replayed);
+          // Granted but the poller has not executed it yet: do so now.
+          const executed = await this.executeApproved(existing, now);
+          return this.approvedOutcomeResponse(id, executed);
         }
         return this.approvedOutcomeResponse(id, existing);
       }
@@ -616,6 +652,32 @@ export class GateServer {
           executed_at: approval.executed_at
         }
       });
+    }
+    if (approval.execution_status === "in_progress" || approval.execution_status === undefined) {
+      // A durable claim exists but no final outcome does: the process
+      // died (or is dying) between the claim and the response record.
+      // The downstream may already have moved money, so never retry
+      // automatically. Surface the ambiguity to the agent and the
+      // operator instead.
+      return response(
+        id,
+        textResult(
+          {
+            status: "execution_in_progress_or_unknown",
+            executed: "unknown",
+            decision: "hold",
+            reason_code: "bridge.execution.reconciliation_required",
+            approval_id: approval.approval_id,
+            execution_started_at: approval.execution_started_at ?? null,
+            guidance:
+              "This approved call was durably claimed for execution, but no final outcome is recorded yet. " +
+              "The gate will not retry it because the downstream may already have moved money. Verify the " +
+              "payment provider using its business idempotency key, then reconcile this approval with " +
+              "`buzz-axiru reconcile`."
+          },
+          true
+        )
+      );
     }
     return response(
       id,
@@ -746,7 +808,7 @@ export class GateServer {
           guidance:
             "This payment tool call was NOT executed. A human has been asked to decide. " +
             "Hold, then call the same tool again with identical arguments after they respond. " +
-            "The gate will execute the original call exactly once if it is approved."
+            "If approved, the gate will durably claim the original call before executing it."
         },
         false
       )
@@ -802,14 +864,19 @@ export class GateServer {
       memo: string;
       now: Date;
     },
-    status: "executed" | "failed",
+    status: "in_progress" | "executed" | "failed",
     error: string | undefined
   ): void {
     this.bridge.ledger.append({
       type: "execution",
       actor: "bridge",
       agent_pubkey: this.agentPubkey,
-      reason_code: status === "executed" ? "bridge.execution.ok" : "bridge.execution.failed",
+      reason_code:
+        status === "in_progress"
+          ? "bridge.execution.started"
+          : status === "executed"
+            ? "bridge.execution.ok"
+            : "bridge.execution.failed",
       amount_minor_units: meta.amount_minor_units,
       currency: meta.currency,
       counterparty: meta.counterparty,
@@ -840,43 +907,60 @@ export class GateServer {
     });
   }
 
-  /** Replay one granted parked call against the downstream server. */
+  /** Durably claim and execute one granted parked call downstream. */
   private async executeApproved(approval: ApprovalRequest, now: Date): Promise<ApprovalRequest> {
-    if (this.executing.has(approval.approval_id)) return approval;
+    if (this.executing.has(approval.approval_id)) {
+      return this.bridge.approvals.get(approval.approval_id) ?? approval;
+    }
     if (approval.call === undefined) {
       // An advisory-mode approval that shares this data directory has
-      // no parked call. Nothing to replay, and inventing one would be
+      // no parked call. Nothing to execute, and inventing one would be
       // executing something no human ever saw.
       return approval;
     }
+    // The claim is the at-most-once boundary: it is persisted BEFORE
+    // the downstream call, so a crash on either side of the network
+    // side effect leaves an in_progress record that is never retried
+    // automatically. Exactly one claimer wins across processes.
+    const claim = this.bridge.approvals.claimExecution(approval.approval_id, now);
+    if (!claim.claimed) return claim.approval;
     this.executing.add(approval.approval_id);
     try {
-      const call = approval.call;
+      const claimed = claim.approval;
+      const call = claimed.call!;
       const meta = {
-        approval_id: approval.approval_id,
-        fingerprint: approval.fingerprint,
-        amount_minor_units: approval.amount_minor_units,
-        currency: approval.currency,
-        counterparty: approval.counterparty,
-        memo: approval.memo,
+        approval_id: claimed.approval_id,
+        fingerprint: claimed.fingerprint,
+        amount_minor_units: claimed.amount_minor_units,
+        currency: claimed.currency,
+        counterparty: claimed.counterparty,
+        memo: claimed.memo,
         now
       };
+      // Audit the claim before the network side effect. Any failure
+      // from here onward leaves the approval non-retryable and
+      // requiring manual reconciliation.
+      this.appendExecution(call.tool_name, meta, "in_progress", undefined);
+      let result: unknown;
       try {
-        const result = await this.downstream.callTool(call.tool_name, call.arguments);
-        this.appendExecution(call.tool_name, meta, "executed", undefined);
-        return this.bridge.approvals.recordExecution(approval.approval_id, {
-          status: "executed",
-          result,
-          at: now
-        });
+        result = await this.downstream.callTool(call.tool_name, call.arguments);
       } catch (err) {
         this.appendExecution(call.tool_name, meta, "failed", (err as Error).message);
-        return this.bridge.approvals.recordExecution(approval.approval_id, {
+        return this.bridge.approvals.recordExecution(claimed.approval_id, {
           status: "failed",
           error: (err as Error).message,
           at: now
         });
       }
+      // Keep persistence failures out of the downstream-error catch.
+      // If either write fails after the provider returned success, the
+      // durable claim remains in_progress and therefore non-retryable.
+      this.appendExecution(call.tool_name, meta, "executed", undefined);
+      return this.bridge.approvals.recordExecution(claimed.approval_id, {
+        status: "executed",
+        result,
+        at: now
+      });
     } finally {
       this.executing.delete(approval.approval_id);
     }
@@ -884,8 +968,8 @@ export class GateServer {
 
   /**
    * One sweep of the approval queue: expire overdue pending approvals
-   * and replay granted parked calls that have not executed yet. The
-   * serve loop calls this on an interval; tests call it directly.
+   * and execute granted parked calls that have not been claimed yet.
+   * The serve loop calls this on an interval; tests call it directly.
    */
   async processApprovals(now: Date = this.clock()): Promise<void> {
     const all = this.bridge.approvals.pending();
@@ -900,13 +984,18 @@ export class GateServer {
     }
     for (const approval of this.granteesAwaitingExecution()) {
       const executed = await this.executeApproved(approval, now);
-      if (executed.execution_status !== undefined) {
+      // An approval left in_progress by a crash is deliberately NOT a
+      // decided outcome; the operator resolves it via `reconcile`.
+      if (executed.execution_status === "executed" || executed.execution_status === "failed") {
         await notifyApprovalDecided(this.config, executed);
       }
     }
   }
 
   private granteesAwaitingExecution(): ApprovalRequest[] {
+    // execution_status undefined means never claimed. An in_progress
+    // record from a previous run is excluded on purpose: replaying it
+    // is exactly the double-payment this claim design exists to stop.
     return this.bridge.approvals
       .all()
       .filter(

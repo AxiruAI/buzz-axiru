@@ -10,8 +10,8 @@
  *      DENIED, and the downstream server never sees the call,
  *   2. the agent calls it for USD 40,000.00: parked for approval,
  *      channel post drafted, downstream still untouched,
- *   3. a human approves from the CLI; the gate replays the original
- *      call downstream exactly once and shows the payment receipt,
+ *   3. a human approves from the CLI; the gate durably claims and
+ *      executes the original call, then shows the payment receipt,
  *   4. the ledger chain verifies.
  *
  * Run: npm run demo        (set DEMO_FAST=1 to skip the pauses)
@@ -30,6 +30,7 @@ import { verifyLedger } from "../src/ledger.js";
 import { approvalRequestText, formatAmount } from "../src/notify.js";
 
 const AGENT_PUBKEY = "b7a1c3d9e5f2064788a9b0c1d2e3f405162738495a6b7c8d9e0f1a2b3c4d5e6f";
+const VERSION = "0.4.0";
 // Buzz launch day, 15:00 New York time: inside the business-hours window.
 const CLOCK = new Date("2026-07-21T15:00:00-04:00");
 const FAST = process.env.DEMO_FAST === "1";
@@ -122,7 +123,7 @@ async function main(): Promise<void> {
 
   const config = loadConfig(policiesPath, dataDir);
   const bridge = new Bridge(config);
-  const gate = new GateServer(bridge, "0.2.0", { clock: () => CLOCK, quiet: true });
+  const gate = new GateServer(bridge, VERSION, { clock: () => CLOCK, quiet: true });
   await gate.start();
 
   // Seed one prior authorized spend so rolling-window history exists
@@ -144,7 +145,7 @@ async function main(): Promise<void> {
 
   try {
     await say("");
-    await say("  buzz-axiru 0.2.0 | gate mode: the agent's only path to money runs through policy", 700);
+    await say(`  buzz-axiru ${VERSION} | gate mode: the agent's only path to money runs through policy`, 700);
     await say("  downstream: fake-payments MCP server (spawned child) | gated: create_payment, refund_*");
     await say("  policy: daily cap USD 100,000.00 | ceiling USD 25,000.00 | allowlist | business hours ET", 900);
     await say("");
@@ -201,12 +202,12 @@ async function main(): Promise<void> {
       note: "invoice checked",
       ts: CLOCK.toISOString()
     });
-    await say("      granted by marcos; the gate replays the ORIGINAL call downstream...", 700);
+    await say("      granted by marcos; the gate durably claims the ORIGINAL call downstream...", 700);
     await gate.processApprovals(CLOCK);
     const approval = bridge.approvals.get(approvalId)!;
     const receipt = bodyOf((approval.execution_result ?? {}) as Record<string, unknown>);
     await say("");
-    await say(`      execution:  ${approval.execution_status} (exactly once)`);
+    await say(`      execution:  ${approval.execution_status} (durable at-most-once claim)`);
     await say(`      receipt:    payment_id ${receipt.payment_id}, ${formatAmount("4000000", "USD")} to ${receipt.destination}`);
     await say(`      downstream: ${downstreamCallCount()} call received, the one a human approved`, 1000);
     await say("");
@@ -216,7 +217,8 @@ async function main(): Promise<void> {
     const result = verifyLedger(bridge.ledger.filePath);
     await say(`      ${JSON.stringify(result)}`, 900);
     await say("");
-    await say("  Deny never reached the rail. Approval executed exactly once. All of it in one");
+    await say("  Deny never reached the rail. Approval executed once on the successful path, with");
+    await say("  retries guarded by a durable at-most-once claim. All of it landed in one");
     await say("  tamper-evident log. The agent's only path to money ran through the decision.");
     await say("");
   } finally {

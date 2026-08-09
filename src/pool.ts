@@ -89,11 +89,11 @@ export class DownstreamPool {
    * matching how request() picks a target.
    */
   get capabilities(): Record<string, unknown> {
-    const union: Record<string, unknown> = {};
+    const union = Object.create(null) as Record<string, unknown>;
     for (const member of this.members) {
       for (const [key, value] of Object.entries(member.client.capabilities)) {
         if (key === "tools") continue;
-        if (!(key in union)) union[key] = value;
+        if (!Object.prototype.hasOwnProperty.call(union, key)) union[key] = value;
       }
     }
     return union;
@@ -152,10 +152,16 @@ export class DownstreamPool {
       const hide = new Set(member.config.hide_tools);
       const tools = await member.client.listTools();
       for (const tool of tools) {
-        if (typeof tool.name !== "string" || CONTROL_CHARS.test(tool.name)) {
+        if (
+          typeof tool.name !== "string" ||
+          tool.name.length === 0 ||
+          tool.name.length > 1_024 ||
+          CONTROL_CHARS.test(tool.name)
+        ) {
           throw new DownstreamError(
             `buzz-axiru: downstream server "${member.config.name}" advertised a tool whose name ` +
-              "contains a control character. Refusing to run: that name cannot be matched " +
+              "is empty, over 1024 characters, or contains a control character. Refusing to run: " +
+              "that name cannot be matched " +
               "against gate patterns or shown to a human approver truthfully."
           );
         }
@@ -239,7 +245,7 @@ export class DownstreamPool {
   private targetFor(method: string): Member | null {
     const key = capabilityKey(method);
     for (const member of this.members) {
-      if (key in member.client.capabilities) return member;
+      if (Object.prototype.hasOwnProperty.call(member.client.capabilities, key)) return member;
     }
     // Methods outside any capability namespace (ping and friends) have
     // no natural owner; the first server answers for the pool.

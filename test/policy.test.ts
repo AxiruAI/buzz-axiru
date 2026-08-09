@@ -86,7 +86,7 @@ test("outside business hours, spend routes to a human", async () => {
   assert.equal(decision.reason_code, "guardrails.pending.outside_business_hours");
 });
 
-test("human approval flow: grant, consume once, then back through policy", async () => {
+test("human approval flow: a consumed grant cannot authorize the same intent again", async () => {
   const { bridge } = makeBridge();
   seedAllow(bridge, "50000", new Date(NOON_UTC.getTime() - HOUR));
 
@@ -101,9 +101,12 @@ test("human approval flow: grant, consume once, then back through policy", async
   assert.equal(second.reason_code, "bridge.allow.human_approved");
   assert.equal(second.approval_id, approvalId);
 
-  // The grant is single-use: the same intent now goes back through policy.
+  // The grant is single-use: an identical retry is explicitly refused,
+  // rather than being presented as a new pending approval backed by the
+  // already-consumed record.
   const third = await bridge.evaluate(request("4000000"), NOON_UTC);
-  assert.equal(third.decision, "require_approval");
+  assert.equal(third.decision, "deny");
+  assert.equal(third.reason_code, "bridge.deny.approval_already_consumed");
 });
 
 test("human denial is sticky for the same intent", async () => {
@@ -138,4 +141,59 @@ test("every decision lands in the ledger with the agent pubkey as actor", async 
   const result = verifyLedger(bridge.ledger.filePath);
   assert.equal(result.ok, true);
   assert.equal(result.records, 2);
+});
+
+test("one payment cannot jump from below the daily cap to above it", async () => {
+  const { bridge } = makeBridge();
+  seedAllow(bridge, "9000000", new Date(NOON_UTC.getTime() - HOUR));
+  const decision = await bridge.evaluate(request("1000001"), NOON_UTC);
+  assert.equal(decision.decision, "deny");
+  assert.equal(decision.reason_code, "guardrails.deny.daily_cap_exceeded");
+});
+
+test("a payment may land exactly on the daily cap", async () => {
+  const { bridge } = makeBridge();
+  seedAllow(bridge, "9000000", new Date(NOON_UTC.getTime() - HOUR));
+  const decision = await bridge.evaluate(request("1000000"), NOON_UTC);
+  assert.equal(decision.decision, "allow");
+});
+
+test("an ambiguous in-progress payment reserves daily-cap headroom", () => {
+  const { bridge } = makeBridge();
+  seedAllow(bridge, "50000", new Date(NOON_UTC.getTime() - HOUR));
+  const approval = bridge.approvals.createOrGet(
+    {
+      fingerprint: "sha256:" + "5b".repeat(32),
+      agent_pubkey: AGENT_PUBKEY,
+      amount_minor_units: "8950000",
+      currency: "USD",
+      counterparty: "acme-datacenter.example",
+      memo: "ambiguous provider response",
+      reason_code: "guardrails.pending.above_approval_threshold",
+      call: { tool_name: "create_payment", arguments: { amount: "8950000" } }
+    },
+    NOON_UTC
+  );
+  bridge.approvals.decide(approval.approval_id, "granted", "tester", undefined, NOON_UTC);
+  bridge.approvals.claimExecution(approval.approval_id, NOON_UTC);
+
+  const blocked = bridge.policyEvaluate(request("1000001"), NOON_UTC).result;
+  assert.equal(blocked.decision, "deny");
+  assert.equal(blocked.reason_code, "guardrails.deny.daily_cap_exceeded");
+
+  bridge.approvals.recordExecution(approval.approval_id, {
+    status: "failed",
+    error: "operator confirmed no transfer",
+    at: NOON_UTC
+  });
+  const afterReconciliation = bridge.policyEvaluate(request("1000001"), NOON_UTC).result;
+  assert.equal(afterReconciliation.decision, "allow");
+});
+
+test("a different currency cannot bypass this policy pack's amount controls", async () => {
+  const { bridge } = makeBridge();
+  await assert.rejects(
+    bridge.evaluate({ ...request("100"), currency: "EUR" }, NOON_UTC),
+    /does not match the policy currency/
+  );
 });

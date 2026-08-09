@@ -28,7 +28,16 @@
  */
 
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  writeFileSync
+} from "node:fs";
 import { dirname } from "node:path";
 
 import { canonicalJsonStringify } from "@axiru/agent-spend-guardrails";
@@ -67,7 +76,7 @@ export interface LedgerEntryInput {
   /** Gate mode: the downstream tool this record concerns. */
   tool_name?: string;
   /** For "execution" records: did the downstream call succeed. */
-  execution_status?: "executed" | "failed";
+  execution_status?: "in_progress" | "executed" | "failed";
   /** For failed executions: the downstream error, verbatim. */
   error?: string;
   approval_id?: string;
@@ -111,12 +120,20 @@ export class Ledger {
   private lastHash = GENESIS_HASH;
 
   constructor(public readonly filePath: string) {
-    mkdirSync(dirname(filePath), { recursive: true });
+    mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 });
+    if (existsSync(filePath)) chmodSync(filePath, 0o600);
     this.syncTail();
   }
 
   private syncTail(): void {
     const lines = parseLines(this.filePath);
+    const verified = verifyLines(lines);
+    if (!verified.ok) {
+      throw new Error(
+        `buzz-axiru: ledger integrity check failed at sequence ${verified.bad_seq}: ` +
+          `${verified.reason}. Refusing to append to an untrusted audit trail.`
+      );
+    }
     if (lines.length > 0) {
       const tail = JSON.parse(lines[lines.length - 1]!) as LedgerRecord;
       this.lastSeq = tail.seq;
@@ -141,7 +158,15 @@ export class Ledger {
         prev_hash: this.lastHash
       };
       const record: LedgerRecord = { ...unhashed, hash: hashRecord(unhashed) };
-      appendFileSync(this.filePath, JSON.stringify(record) + "\n", "utf8");
+      const existed = existsSync(this.filePath);
+      const fd = openSync(this.filePath, "a", 0o600);
+      try {
+        writeFileSync(fd, JSON.stringify(record) + "\n", "utf8");
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      if (!existed) fsyncDirectory(dirname(this.filePath));
       this.lastSeq = record.seq;
       this.lastHash = record.hash;
       return record;
@@ -150,6 +175,20 @@ export class Ledger {
 
   get head(): { seq: number; hash: string } {
     return { seq: this.lastSeq, hash: this.lastHash };
+  }
+}
+
+/** Persist first-file creation where directory fsync is supported. */
+function fsyncDirectory(path: string): void {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, "r");
+    fsyncSync(fd);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (process.platform !== "win32" && code !== "EINVAL" && code !== "ENOTSUP") throw err;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
   }
 }
 
@@ -168,9 +207,7 @@ export interface VerifyFail {
 
 export type VerifyResult = VerifyOk | VerifyFail;
 
-/** Re-derive the whole chain. Reports the first record that fails. */
-export function verifyLedger(filePath: string): VerifyResult {
-  const lines = parseLines(filePath);
+function verifyLines(lines: string[]): VerifyResult {
   let prevHash = GENESIS_HASH;
   let prevSeq = 0;
 
@@ -212,6 +249,11 @@ export function verifyLedger(filePath: string): VerifyResult {
   return { ok: true, records: lines.length, head_hash: prevHash };
 }
 
+/** Re-derive the whole chain. Reports the first record that fails. */
+export function verifyLedger(filePath: string): VerifyResult {
+  return verifyLines(parseLines(filePath));
+}
+
 export interface AgentHistory {
   amount_24h: string;
   amount_30d: string;
@@ -244,6 +286,13 @@ export function historyForAgent(
   now: Date
 ): AgentHistory {
   const lines = parseLines(filePath);
+  const verified = verifyLines(lines);
+  if (!verified.ok) {
+    throw new Error(
+      `buzz-axiru: ledger integrity check failed at sequence ${verified.bad_seq}: ` +
+        `${verified.reason}. Refusing to calculate spend history from a corrupted ledger.`
+    );
+  }
   const dayAgo = now.getTime() - 24 * 60 * 60 * 1000;
   const monthAgo = now.getTime() - 30 * 24 * 60 * 60 * 1000;
 
@@ -252,21 +301,46 @@ export function historyForAgent(
   let count24 = 0;
   let count30 = 0;
 
+  const countable: Array<{ record: LedgerRecord; effectiveTs?: string }> = [];
+  const approvedExecutions = new Map<
+    string,
+    { final: LedgerRecord; startedTs?: string }
+  >();
+
   for (const line of lines) {
-    let record: LedgerRecord;
-    try {
-      record = JSON.parse(line) as LedgerRecord;
-    } catch {
-      continue;
-    }
+    const record = JSON.parse(line) as LedgerRecord;
     const advisoryAllow =
       record.type === "decision" && record.decision === "allow" && record.tool_name === undefined;
     const gatedExecution = record.type === "execution" && record.execution_status === "executed";
+    if (record.type === "execution" && record.approval_id !== undefined) {
+      const prior = approvedExecutions.get(record.approval_id);
+      approvedExecutions.set(record.approval_id, {
+        final: record,
+        startedTs:
+          prior?.startedTs ??
+          (record.execution_status === "in_progress" ? record.ts : undefined)
+      });
+      continue;
+    }
     if (!advisoryAllow && !gatedExecution) continue;
+    countable.push({ record });
+  }
+  // One human approval is one possible transfer. A crash can leave an
+  // executed ledger record and an in_progress approval-store record,
+  // after which manual reconciliation appends a second final record.
+  // Count the final state once, using the original claim time when it
+  // exists, so audit recovery cannot double the rolling spend amount.
+  for (const { final, startedTs } of approvedExecutions.values()) {
+    if (final.execution_status === "executed") {
+      countable.push({ record: final, effectiveTs: startedTs });
+    }
+  }
+
+  for (const { record, effectiveTs } of countable) {
     if (record.agent_pubkey !== agentPubkey) continue;
     if (record.currency !== currency) continue;
     if (!INTEGER_AMOUNT.test(record.amount_minor_units)) continue;
-    const t = Date.parse(record.ts);
+    const t = Date.parse(effectiveTs ?? record.ts);
     if (Number.isNaN(t) || t > now.getTime()) continue;
     const amount = BigInt(record.amount_minor_units);
     if (t >= monthAgo) {

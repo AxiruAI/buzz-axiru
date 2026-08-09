@@ -26,7 +26,7 @@
  * unreadable-amount placeholder) come from the agent's own tool
  * arguments. A prompt-injected agent that can put a newline in a memo
  * can forge any other line of this message, including a smaller
- * amount and a different approval id in the "To decide" line. So every
+ * amount and a different approval id in an instruction line. So every
  * interpolated field is flattened to a single line and truncated
  * before it reaches the text. The buzz CLI is invoked with execFile
  * and an argv array, never a shell string, so the same fields cannot
@@ -88,7 +88,11 @@ export function approvalRequestText(approval: ApprovalRequest): string {
     `  reason:       ${s(approval.reason_code)}`,
     `  approval id:  ${s(approval.approval_id)}`,
     "",
-    `To decide: buzz-axiru approve ${s(approval.approval_id)}   or   buzz-axiru deny ${s(approval.approval_id)}`
+    `Inspect exact call: buzz-axiru show ${s(approval.approval_id)}`,
+    `Then decide:       buzz-axiru approve ${s(approval.approval_id)}   or   buzz-axiru deny ${s(approval.approval_id)}`,
+    ...(approval.amount_minor_units === "unknown"
+      ? ["Unknown amount: approval also requires --ack-unknown-amount after inspection."]
+      : [])
   ].join("\n");
 }
 
@@ -115,6 +119,34 @@ export function approvalOutcomeText(approval: ApprovalRequest): string {
   ].join("\n");
 }
 
+/**
+ * Webhooks receive the decision summary, never the parked tool
+ * arguments or the downstream execution result. Those objects can
+ * contain API tokens, card/customer data, and provider responses that
+ * do not belong in a notification integration.
+ */
+export function approvalWebhookPayload(approval: ApprovalRequest): Record<string, unknown> {
+  return {
+    approval_id: approval.approval_id,
+    fingerprint: approval.fingerprint,
+    agent_pubkey: approval.agent_pubkey,
+    amount_minor_units: approval.amount_minor_units,
+    currency: approval.currency,
+    counterparty: approval.counterparty,
+    reason_code: approval.reason_code,
+    requested_at: approval.requested_at,
+    status: approval.status,
+    expires_at: approval.expires_at ?? null,
+    decided_by: approval.decided_by ?? null,
+    decided_at: approval.decided_at ?? null,
+    note: approval.note ?? null,
+    tool_name: approval.call?.tool_name ?? null,
+    execution_status: approval.execution_status ?? null,
+    execution_started_at: approval.execution_started_at ?? null,
+    executed_at: approval.executed_at ?? null
+  };
+}
+
 function postToBuzzChannel(config: BridgeConfig, text: string): Promise<void> {
   return new Promise((resolvePromise) => {
     if (!config.buzz.channel_id) return resolvePromise();
@@ -128,7 +160,8 @@ function postToBuzzChannel(config: BridgeConfig, text: string): Promise<void> {
       (error, _stdout, stderr) => {
         if (error) {
           process.stderr.write(
-            `buzz-axiru: channel post failed (${error.message}); stderr: ${stderr}\n`
+            `buzz-axiru: channel post failed (${sanitizeForChannel(error.message)}); ` +
+              `stderr: ${sanitizeForChannel(stderr, 500)}\n`
           );
         }
         resolvePromise();
@@ -143,7 +176,9 @@ async function postWebhook(config: BridgeConfig, payload: unknown): Promise<void
     const response = await fetch(config.webhook_url, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
+      redirect: "error",
+      signal: AbortSignal.timeout(10_000)
     });
     if (!response.ok) {
       process.stderr.write(`buzz-axiru: webhook returned HTTP ${response.status}\n`);
@@ -169,7 +204,10 @@ export async function notifyApprovalRequested(
   logLocal(text);
   await Promise.all([
     postToBuzzChannel(config, text),
-    postWebhook(config, { type: "spend_approval_requested", approval })
+    postWebhook(config, {
+      type: "spend_approval_requested",
+      approval: approvalWebhookPayload(approval)
+    })
   ]);
 }
 
@@ -182,6 +220,9 @@ export async function notifyApprovalDecided(
   logLocal(text);
   await Promise.all([
     postToBuzzChannel(config, text),
-    postWebhook(config, { type: "spend_approval_decided", approval })
+    postWebhook(config, {
+      type: "spend_approval_decided",
+      approval: approvalWebhookPayload(approval)
+    })
   ]);
 }

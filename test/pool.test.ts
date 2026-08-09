@@ -341,3 +341,40 @@ test("gate mode fans out across two servers and gates only the prefixed money to
     gate.close();
   }
 });
+
+test("inherited object properties are never treated as advertised capabilities", async () => {
+  const pool = await started([server("shell", ["run"])]);
+  try {
+    assert.equal(Object.getPrototypeOf(pool.capabilities), null);
+    assert.equal(Object.prototype.hasOwnProperty.call(pool.capabilities, "constructor"), false);
+    await assert.rejects(
+      () => pool.request("constructor/list"),
+      /no configured downstream server advertises the "constructor" capability/
+    );
+  } finally {
+    pool.close();
+  }
+});
+
+test("non-object downstream stdout noise cannot crash the gate", async () => {
+  const pool = await started([
+    server("noisy", ["run"], {}, { FAKE_MULTI_INITIALIZE_NOISE: "null" })
+  ]);
+  try {
+    assert.equal(pool.alive, true);
+    assert.deepEqual((await pool.listTools()).map((tool) => tool.name), ["run"]);
+  } finally {
+    pool.close();
+  }
+});
+
+test("deep downstream tool schemas are rejected before tools/list can crash serialization", async () => {
+  const pool = new DownstreamPool([
+    server("deep", ["run"], {}, { FAKE_MULTI_DEEP_SCHEMA: "1" })
+  ]);
+  await assert.rejects(
+    () => pool.start("2025-06-18", "test"),
+    /tool schemas are nested deeper than 64 levels/
+  );
+  pool.close();
+});

@@ -43,8 +43,9 @@ export {
   legacyApprovalIdForFingerprint,
   isExpired,
   type ApprovalRequest,
-  type ParkedCall
+  type ParkedCall,
+  type ExecutionClaim
 } from "./approvals.js";
 export { STARTER_POLICIES } from "./scaffold.js";
 export { McpServer, jsonShapeProblem, serveNdjson, TOOL_DEFINITION, TOOL_NAME } from "./mcp.js";
-export { formatAmount, sanitizeForChannel } from "./notify.js";
+export { formatAmount, sanitizeForChannel, approvalWebhookPayload } from "./notify.js";

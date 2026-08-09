@@ -33,6 +33,7 @@
  * Licensed under the Apache License, Version 2.0.
  */
 
+import { randomUUID } from "node:crypto";
 import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
@@ -50,6 +51,7 @@ interface LockOwner {
   pid: number;
   host: string;
   at: number;
+  token: string;
 }
 
 /**
@@ -67,7 +69,12 @@ function readOwner(lockPath: string): LockOwner | null {
   try {
     const parsed = JSON.parse(readFileSync(lockPath, "utf8")) as Partial<LockOwner>;
     if (typeof parsed.pid !== "number" || typeof parsed.at !== "number") return null;
-    return { pid: parsed.pid, host: typeof parsed.host === "string" ? parsed.host : "", at: parsed.at };
+    return {
+      pid: parsed.pid,
+      host: typeof parsed.host === "string" ? parsed.host : "",
+      at: parsed.at,
+      token: typeof parsed.token === "string" ? parsed.token : ""
+    };
   } catch {
     // Unreadable or half-written: treat as unknown owner, not as free.
     return null;
@@ -87,24 +94,31 @@ function pidAlive(pid: number): boolean {
 
 function isStale(owner: LockOwner | null, now: number): boolean {
   if (owner === null) return false;
-  if (owner.host === hostname() && !pidAlive(owner.pid)) return true;
+  // Never steal a lock from a live process on this host merely because
+  // a slow filesystem kept its critical section open for a minute.
+  if (owner.host === hostname()) return !pidAlive(owner.pid);
   return now - owner.at > STALE_AFTER_MS;
 }
 
 /** Acquire the lock, blocking until it is ours or the timeout expires. */
-function acquire(lockPath: string, timeoutMs: number): void {
+function acquire(lockPath: string, timeoutMs: number): LockOwner {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
       // "wx" is O_CREAT|O_EXCL: exactly one racer creates the file.
-      const fd = openSync(lockPath, "wx");
+      const fd = openSync(lockPath, "wx", 0o600);
+      const owner: LockOwner = {
+        pid: process.pid,
+        host: hostname(),
+        at: Date.now(),
+        token: randomUUID()
+      };
       try {
-        const owner: LockOwner = { pid: process.pid, host: hostname(), at: Date.now() };
         writeSync(fd, JSON.stringify(owner));
       } finally {
         closeSync(fd);
       }
-      return;
+      return owner;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
     }
@@ -130,8 +144,12 @@ function acquire(lockPath: string, timeoutMs: number): void {
   }
 }
 
-function release(lockPath: string): void {
+function release(lockPath: string, owner: LockOwner): void {
   try {
+    // A stale-lock recovery may have replaced the path while this
+    // process was paused. Only unlink the inode represented by our own
+    // ownership token; never remove a newer process's lock.
+    if (readOwner(lockPath)?.token !== owner.token) return;
     unlinkSync(lockPath);
   } catch {
     // Already gone (reclaimed as stale while we held it). Nothing to undo.
@@ -154,13 +172,13 @@ export function withDataDirLock<T>(dataDir: string, fn: () => T, timeoutMs = DEF
       held.set(lockPath, (held.get(lockPath) ?? 1) - 1);
     }
   }
-  mkdirSync(dataDir, { recursive: true });
-  acquire(lockPath, timeoutMs);
+  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  const owner = acquire(lockPath, timeoutMs);
   held.set(lockPath, 1);
   try {
     return fn();
   } finally {
     held.set(lockPath, 0);
-    release(lockPath);
+    release(lockPath, owner);
   }
 }

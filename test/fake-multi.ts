@@ -21,15 +21,24 @@ const TOOL_NAMES = (process.env.FAKE_MULTI_TOOLS ?? "alpha")
   .map((t) => t.trim())
   .filter((t) => t.length > 0);
 const DIE_TOOL = process.env.FAKE_MULTI_DIE;
+const INITIALIZE_NOISE = process.env.FAKE_MULTI_INITIALIZE_NOISE;
+const DEEP_SCHEMA = process.env.FAKE_MULTI_DEEP_SCHEMA === "1";
 
 function write(message: unknown): void {
   process.stdout.write(JSON.stringify(message) + "\n");
 }
 
+let inputSchema: Record<string, unknown> = { type: "object", properties: {} };
+if (DEEP_SCHEMA) {
+  for (let i = 0; i < 80; i++) {
+    inputSchema = { type: "object", properties: { nested: inputSchema } };
+  }
+}
+
 const TOOLS = TOOL_NAMES.map((name) => ({
   name,
   description: `${name} on ${NAME}`,
-  inputSchema: { type: "object", properties: {} }
+  inputSchema
 }));
 
 const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
@@ -44,6 +53,7 @@ rl.on("line", (line) => {
   const id = message.id;
   switch (message.method) {
     case "initialize":
+      if (INITIALIZE_NOISE === "null") write(null);
       write({
         jsonrpc: "2.0",
         id,

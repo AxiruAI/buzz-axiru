@@ -17,6 +17,7 @@ import { basename, resolve } from "node:path";
 import {
   businessHoursOnly,
   counterpartyAllowlist,
+  defineSpendPolicy,
   humanApprovalAboveAmount,
   perAgentDailyCap,
   velocityCountCap,
@@ -42,6 +43,13 @@ export interface BridgeControls {
     max_count: number;
     effect?: "deny" | "require_approval";
   };
+}
+
+export interface SpendHistorySnapshot {
+  amount_24h: string;
+  amount_30d: string;
+  count_24h: number;
+  count_30d: number;
 }
 
 export interface BuzzChannelConfig {
@@ -75,15 +83,15 @@ export interface DownstreamConfig {
   /**
    * Which of the bridge's own environment variables the child inherits.
    *
-   * "all" (the default, and the historical behaviour) hands the child
+   * "all" (the historical pre-0.4 behaviour) hands the child
    * every variable this process has, which means the bridge's Buzz
    * signing key and one payment server's API key are both visible to
    * every other downstream server the operator configures. That is a
    * lot of trust to place in a server chosen for an unrelated job.
-   * "none" passes nothing but `env`, and an array names the variables
-   * to forward. Kept defaulting to "all" so existing configs do not
-   * break on upgrade; operators running more than one downstream
-   * server should narrow it.
+   * "none" (the secure default) passes nothing but `env`, and an array
+   * names the variables to forward. Generated configs use an explicit
+   * small allowlist so unrelated downstream tools never receive the
+   * bridge signing key or another server's API credentials.
    */
   env_passthrough: "all" | "none" | string[];
   /** Per-request timeout against the downstream server. Default 30000. */
@@ -182,7 +190,8 @@ export interface BridgeConfig {
    * downstream tool calls carry no agent_pubkey argument. Overridden
    * by BUZZ_AXIRU_AGENT_PUBKEY. If neither is set the gate still fails
    * closed: decisions are attributed to the all-zeros pubkey, so every
-   * unattributed agent shares one daily cap.
+   * unattributed agent shares one daily cap. `buzz-axiru doctor` flags
+   * the missing identity as not ready.
    */
   agent_pubkey: string | null;
 }
@@ -207,11 +216,16 @@ export function loadConfig(policiesPath?: string, dataDirOverride?: string): Bri
   }
   const doc = raw as Record<string, unknown>;
 
-  const rail = typeof doc.rail === "string" && doc.rail.length > 0 ? doc.rail : "x402";
+  const rail = typeof doc.rail === "string" && doc.rail.trim().length > 0 ? doc.rail.trim() : "x402";
   const currency =
-    typeof doc.currency === "string" && doc.currency.length > 0
-      ? doc.currency.toUpperCase()
+    typeof doc.currency === "string" && doc.currency.trim().length > 0
+      ? doc.currency.trim().toUpperCase()
       : "USD";
+  if (!/^[A-Z0-9._-]{2,20}$/.test(currency)) {
+    throw new Error(
+      `buzz-axiru: ${path}: currency must be a 2-20 character currency or token symbol`
+    );
+  }
   const controls = (doc.controls ?? {}) as BridgeControls;
 
   const buzzRaw = (doc.buzz ?? {}) as Record<string, unknown>;
@@ -298,14 +312,22 @@ function parseDownstreamEntry(raw: unknown, path: string, label: string): Downst
   if (!Array.isArray(args) || !args.every((a) => typeof a === "string")) {
     throw new Error(`buzz-axiru: ${path}: ${label}.args must be an array of strings`);
   }
-  const env: Record<string, string> = {};
+  if ((args as string[]).some((arg) => arg.includes("PIN_REVIEWED_VERSION"))) {
+    throw new Error(
+      `buzz-axiru: ${path}: ${label}.args still contains PIN_REVIEWED_VERSION; ` +
+        "replace it with an exact downstream package version you reviewed"
+    );
+  }
+  const env = Object.create(null) as Record<string, string>;
   if (d.env !== undefined && d.env !== null) {
-    if (typeof d.env !== "object") {
+    if (typeof d.env !== "object" || Array.isArray(d.env)) {
       throw new Error(`buzz-axiru: ${path}: ${label}.env must be an object of strings`);
     }
     for (const [key, value] of Object.entries(d.env as Record<string, unknown>)) {
       if (key.startsWith("$")) continue;
-      if (isUnsafeKey(key)) continue;
+      if (!ENV_NAME_RE.test(key) || isUnsafeKey(key)) {
+        throw new Error(`buzz-axiru: ${path}: ${label}.env has an invalid variable name "${key}"`);
+      }
       if (typeof value !== "string") {
         throw new Error(`buzz-axiru: ${path}: ${label}.env.${key} must be a string`);
       }
@@ -315,8 +337,10 @@ function parseDownstreamEntry(raw: unknown, path: string, label: string): Downst
   const env_passthrough = parseEnvPassthrough(d.env_passthrough, path, label);
   const timeout =
     d.request_timeout_ms === undefined ? 30_000 : Number(d.request_timeout_ms);
-  if (!Number.isFinite(timeout) || timeout <= 0) {
-    throw new Error(`buzz-axiru: ${path}: ${label}.request_timeout_ms must be a positive number`);
+  if (!Number.isInteger(timeout) || timeout <= 0 || timeout > 600_000) {
+    throw new Error(
+      `buzz-axiru: ${path}: ${label}.request_timeout_ms must be an integer from 1 to 600000`
+    );
   }
   const hide = d.hide_tools === undefined ? [] : d.hide_tools;
   if (!Array.isArray(hide) || !hide.every((h) => typeof h === "string")) {
@@ -354,9 +378,16 @@ function parseEnvPassthrough(
   path: string,
   label: string
 ): "all" | "none" | string[] {
-  if (raw === undefined || raw === null) return "all";
+  if (raw === undefined || raw === null) return "none";
   if (raw === "all" || raw === "none") return raw;
-  if (Array.isArray(raw) && raw.every((n) => typeof n === "string")) return raw as string[];
+  if (
+    Array.isArray(raw) &&
+    raw.every(
+      (name) => typeof name === "string" && ENV_NAME_RE.test(name) && !isUnsafeKey(name)
+    )
+  ) {
+    return [...new Set(raw as string[])];
+  }
   throw new Error(
     `buzz-axiru: ${path}: ${label}.env_passthrough must be "all", "none", or an array of variable names`
   );
@@ -369,6 +400,7 @@ function parseEnvPassthrough(
  * the cheap defence is to refuse the keys outright.
  */
 const UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 export function isUnsafeKey(key: string): boolean {
   return UNSAFE_KEYS.has(key);
@@ -376,7 +408,7 @@ export function isUnsafeKey(key: string): boolean {
 
 function parsePaymentTools(raw: unknown, path: string): PaymentToolsConfig | null {
   if (raw === undefined || raw === null) return null;
-  if (typeof raw !== "object") {
+  if (typeof raw !== "object" || Array.isArray(raw)) {
     throw new Error(`buzz-axiru: ${path}: "payment_tools" must be an object or absent`);
   }
   const p = raw as Record<string, unknown>;
@@ -386,7 +418,7 @@ function parsePaymentTools(raw: unknown, path: string): PaymentToolsConfig | nul
   }
   const mappings: Record<string, ToolMapping> = {};
   if (p.mappings !== undefined && p.mappings !== null) {
-    if (typeof p.mappings !== "object") {
+    if (typeof p.mappings !== "object" || Array.isArray(p.mappings)) {
       throw new Error(`buzz-axiru: ${path}: payment_tools.mappings must be an object`);
     }
     for (const [key, value] of Object.entries(p.mappings as Record<string, unknown>)) {
@@ -449,8 +481,10 @@ function parseTtl(raw: unknown, path: string): number | null {
   if (raw === undefined) return 86_400;
   if (raw === null) return null;
   const ttl = Number(raw);
-  if (!Number.isFinite(ttl) || ttl <= 0) {
-    throw new Error(`buzz-axiru: ${path}: approval_ttl_seconds must be a positive number or null`);
+  if (!Number.isSafeInteger(ttl) || ttl <= 0 || ttl > 31_536_000) {
+    throw new Error(
+      `buzz-axiru: ${path}: approval_ttl_seconds must be an integer from 1 to 31536000, or null`
+    );
   }
   return ttl;
 }
@@ -459,7 +493,7 @@ function parseMaxPending(raw: unknown, path: string): number | null {
   if (raw === undefined) return 500;
   if (raw === null) return null;
   const max = Number(raw);
-  if (!Number.isInteger(max) || max <= 0) {
+  if (!Number.isSafeInteger(max) || max <= 0) {
     throw new Error(
       `buzz-axiru: ${path}: max_pending_approvals must be a positive integer or null`
     );
@@ -629,7 +663,11 @@ export function extractPayment(
  * cap is instantiated with the agent's pubkey as the initiator id, so
  * caps are enforced per identity, exactly how Buzz scopes agents.
  */
-export function policiesForAgent(config: BridgeConfig, agentPubkey: string): PolicyV2[] {
+export function policiesForAgent(
+  config: BridgeConfig,
+  agentPubkey: string,
+  history?: SpendHistorySnapshot
+): PolicyV2[] {
   const c = config.controls;
   const policies: PolicyV2[] = [];
 
@@ -641,6 +679,39 @@ export function policiesForAgent(config: BridgeConfig, agentPubkey: string): Pol
         cap_minor_units: c.per_agent_daily_cap.cap_minor_units
       })
     );
+    // The preset's rolling-window rule compares PRIOR spend. Add a
+    // second, request-local amount rule for the remaining allowance so
+    // one payment cannot jump from below the cap to above it. A payment
+    // that lands exactly on the cap remains allowed; the first minor
+    // unit over is denied.
+    if (history !== undefined) {
+      const cap = BigInt(c.per_agent_daily_cap.cap_minor_units);
+      const prior = BigInt(history.amount_24h);
+      const firstDeniedAmount = prior >= cap ? 0n : cap - prior + 1n;
+      policies.push(
+        defineSpendPolicy({
+          name: `Remaining daily allowance for agent ${agentPubkey}`,
+          description:
+            `Denies a transfer that would take agent "${agentPubkey}" above its ` +
+            `${c.per_agent_daily_cap.cap_minor_units} ${config.currency} daily cap.`,
+          id: `policy_daily_cap_remaining_${agentPubkey.slice(0, 16)}`,
+          rules: [
+            { kind: "initiator_kind", in: ["agent"] },
+            { kind: "initiator_id", in: [agentPubkey] },
+            {
+              kind: "amount",
+              currency: config.currency,
+              gte: firstDeniedAmount.toString()
+            }
+          ],
+          effect: {
+            kind: "deny",
+            reason_code: "guardrails.deny.daily_cap_exceeded",
+            reason_text: `Transfer would exceed agent ${agentPubkey}'s 24h spend cap`
+          }
+        })
+      );
+    }
   }
   if (c.single_payment_ceiling) {
     policies.push(

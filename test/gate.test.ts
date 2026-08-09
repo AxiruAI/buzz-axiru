@@ -550,7 +550,13 @@ test("execution failure after approval is recorded with a distinct status", asyn
     const approval = ctx.bridge.approvals.get(approvalId)!;
     assert.equal(approval.execution_status, "failed");
     const records = ledgerRecords(ctx.ledgerPath);
-    const failed = records.find((r) => r.type === "execution");
+    const started = records.find(
+      (r) => r.type === "execution" && r.execution_status === "in_progress"
+    );
+    assert.ok(started, "durable execution claim is audited before the call");
+    const failed = records.find(
+      (r) => r.type === "execution" && r.execution_status === "failed"
+    );
     assert.ok(failed);
     assert.equal(failed!.execution_status, "failed");
     assert.equal(failed!.reason_code, "bridge.execution.failed");
@@ -560,6 +566,66 @@ test("execution failure after approval is recorded with a distinct status", asyn
     const body = toolText(after.result!);
     assert.equal(body.status, "execution_failed_after_approval");
     assert.equal(verifyLedger(ctx.ledgerPath).ok, true);
+  } finally {
+    ctx.close();
+  }
+});
+
+test("gate startup refuses a matcher that protects no exposed tool", async () => {
+  await assert.rejects(
+    makeGate((doc) => {
+      doc.payment_tools = { gate: ["does_not_exist"], mappings: {} };
+    }),
+    /protects nothing/
+  );
+});
+
+test("a crash between claim and outcome is never retried and demands reconciliation", async () => {
+  const ctx = await makeGate();
+  try {
+    seedAllow(ctx.bridge, "50000", new Date(NOON_UTC.getTime() - HOUR));
+    const big = { amount: 3000000, currency: "USD", destination: "acme-datacenter.example" };
+    const first = await callTool(ctx.gate, "create_payment", big);
+    const approvalId = toolText(first.result!).approval_id as string;
+
+    // Ledger memos must not echo raw tool arguments (they can carry
+    // tokens or PII); the exact call lives in the approval file only.
+    const parked = ledgerRecords(ctx.ledgerPath).find(
+      (r) => r.type === "decision" && r.tool_name === "create_payment"
+    );
+    assert.equal(parked!.memo, "Gated call to create_payment");
+    assert.equal(ctx.bridge.approvals.get(approvalId)!.call!.arguments.amount, 3000000);
+
+    // Human grants, then the process "crashes" after the durable claim
+    // but before any outcome could be recorded: simulate the torn state
+    // by taking the claim directly, exactly as executeApproved does.
+    ctx.bridge.approvals.decide(approvalId, "granted", "tester", undefined, ctx.now.value);
+    const claim = ctx.bridge.approvals.claimExecution(approvalId, ctx.now.value);
+    assert.equal(claim.claimed, true);
+    assert.equal(claim.approval.execution_status, "in_progress");
+
+    // Restart-equivalent sweep: the ambiguous claim must NOT re-execute.
+    await ctx.gate.processApprovals();
+    assert.equal(downstreamCalls(ctx.logPath).length, 0, "ambiguous claim is never auto-replayed");
+
+    // The agent's identical retry is held for reconciliation, loudly.
+    const retry = await callTool(ctx.gate, "create_payment", big);
+    const body = toolText(retry.result!);
+    assert.equal(body.status, "execution_in_progress_or_unknown");
+    assert.equal(body.reason_code, "bridge.execution.reconciliation_required");
+    assert.equal(body.executed, "unknown");
+    assert.equal(downstreamCalls(ctx.logPath).length, 0);
+
+    // Operator reconciles as failed (what the reconcile command does);
+    // the approval settles and still never re-executes.
+    const after = ctx.bridge.approvals.recordExecution(approvalId, {
+      status: "failed",
+      error: "operator confirmed no transfer",
+      at: ctx.now.value
+    });
+    assert.equal(after.execution_status, "failed");
+    await ctx.gate.processApprovals();
+    assert.equal(downstreamCalls(ctx.logPath).length, 0, "a reconciled approval stays settled");
   } finally {
     ctx.close();
   }

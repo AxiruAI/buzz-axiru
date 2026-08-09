@@ -40,15 +40,17 @@
       "command": "buzz-dev-mcp",
       "args": [],
       "env": {},
+      "env_passthrough": ["PATH", "HOME", "TMPDIR"],
       "request_timeout_ms": 30000,
       "hide_tools": []
     },
     {
-      "$comment": "The payment server, prefixed so shell tools keep their plain names and the gate patterns can target money tools only.",
+      "$comment": "The payment server, prefixed so shell tools keep their plain names and the gate patterns can target money tools only. Replace PIN_REVIEWED_VERSION with an exact package version you reviewed; never launch an unpinned payment server via npx.",
       "name": "payments",
       "command": "npx",
-      "args": ["-y", "@stripe/mcp", "--tools=all"],
-      "env": { "STRIPE_SECRET_KEY": "sk_test_..." },
+      "args": ["-y", "@stripe/mcp@PIN_REVIEWED_VERSION", "--tools=all"],
+      "env": {},
+      "env_passthrough": ["PATH", "HOME", "TMPDIR", "STRIPE_SECRET_KEY"],
       "tool_prefix": "pay_",
       "request_timeout_ms": 30000,
       "hide_tools": []
@@ -76,7 +78,7 @@
   "$approval_ttl_comment": "How long a parked approval stays decidable, in seconds. After this it expires: it can no longer be granted and is never executed. null disables expiry (not recommended).",
 
   "agent_pubkey": null,
-  "$agent_pubkey_comment": "The Nostr pubkey (64-char hex) decisions are attributed to in gate mode. Usually set per instance via BUZZ_AXIRU_AGENT_PUBKEY instead. If neither is set, decisions attribute to the all-zeros pubkey and all unattributed agents share one daily cap.",
+  "$agent_pubkey_comment": "The Nostr pubkey (64-char hex or npub) decisions are attributed to in gate mode. Usually set per instance via BUZZ_AXIRU_AGENT_PUBKEY instead. If neither is set, decisions attribute to the all-zeros pubkey and all unattributed agents share one daily cap; buzz-axiru doctor reports this as not ready.",
 
   "buzz": {
     "$comment": "Set channel_id to a Buzz channel UUID to post approval requests there via the buzz CLI. The CLI must be on PATH and BUZZ_PRIVATE_KEY / BUZZ_RELAY_URL must be set for the bridge's own identity.",

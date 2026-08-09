@@ -1,6 +1,6 @@
 /**
- * `buzz-axiru quickstart`: one command from `npm install -g buzz-axiru`
- * to a governed agent.
+ * `buzz-axiru quickstart`: generate a secure starter configuration and
+ * concrete harness wiring from `npm install -g buzz-axiru`.
  *
  * The manual path (read the README, hand-edit policies.json, export an
  * env var) loses people before the gate ever runs. quickstart collapses
@@ -17,7 +17,7 @@
  * Licensed under the Apache License, Version 2.0.
  */
 
-import { existsSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, writeFileSync } from "node:fs";
 import { basename, delimiter, join } from "node:path";
 
 import { STARTER_POLICIES } from "./scaffold.js";
@@ -78,7 +78,10 @@ export function detectBuzzDevMcp(
  * pay_* as the only gated pattern so shell tools pass through. Without
  * one, downstream is null and the file loads in advisory mode.
  */
-export function buildQuickstartPolicies(shell: DetectedShell | null): string {
+export function buildQuickstartPolicies(
+  shell: DetectedShell | null,
+  agentPubkey: string | null = null
+): string {
   const starter = JSON.parse(STARTER_POLICIES) as Record<string, unknown>;
   const doc: Record<string, unknown> = {
     $comment:
@@ -100,6 +103,7 @@ export function buildQuickstartPolicies(shell: DetectedShell | null): string {
               command: shell.command,
               args: [],
               env: {},
+              env_passthrough: ["PATH", "HOME", "TMPDIR"],
               request_timeout_ms: 30000,
               hide_tools: []
             }
@@ -119,11 +123,13 @@ export function buildQuickstartPolicies(shell: DetectedShell | null): string {
         "because keys starting with $ are ignored. Move this object into the " +
         "downstream array to put your payment server behind the same gate. The " +
         "pay_ tool_prefix keeps shell tool names unchanged and is what lets " +
-        "payment_tools.gate target money tools only.",
+        "payment_tools.gate target money tools only. Replace PIN_REVIEWED_VERSION " +
+        "with an exact downstream package version you have reviewed.",
       name: "payments",
       command: "npx",
-      args: ["-y", "@stripe/mcp", "--tools=all"],
-      env: { STRIPE_SECRET_KEY: "sk_test_..." },
+      args: ["-y", "@stripe/mcp@PIN_REVIEWED_VERSION", "--tools=all"],
+      env: {},
+      env_passthrough: ["PATH", "HOME", "TMPDIR", "STRIPE_SECRET_KEY"],
       tool_prefix: "pay_",
       request_timeout_ms: 30000,
       hide_tools: []
@@ -133,7 +139,7 @@ export function buildQuickstartPolicies(shell: DetectedShell | null): string {
     $approval_ttl_comment: starter["$approval_ttl_comment"],
     max_pending_approvals: starter["max_pending_approvals"],
     $max_pending_comment: starter["$max_pending_comment"],
-    agent_pubkey: null,
+    agent_pubkey: agentPubkey,
     $agent_pubkey_comment: starter["$agent_pubkey_comment"],
     buzz: starter["buzz"],
     webhook_url: null,
@@ -151,7 +157,8 @@ export function writeQuickstartPolicies(path: string, content: string, force: bo
   if (existsSync(path) && !force) {
     throw new Error(`${path} already exists (use --force to overwrite). Nothing was written.`);
   }
-  writeFileSync(path, content, "utf8");
+  writeFileSync(path, content, { encoding: "utf8", mode: 0o600 });
+  chmodSync(path, 0o600);
 }
 
 /**
@@ -168,7 +175,7 @@ export function harnessNextSteps(harness: string): string {
         "       export BUZZ_ACP_MCP_COMMAND=buzz-axiru",
         "  2. Restart the agent in Buzz. Its tools now route through the gate.",
         "  3. Prove it works:",
-        "       buzz-axiru quickstart --check"
+        "       buzz-axiru doctor"
       ].join("\n");
     case "goose":
       return [
@@ -185,7 +192,7 @@ export function harnessNextSteps(harness: string): string {
         "",
         "  2. Restart goose.",
         "  3. Prove it works:",
-        "       buzz-axiru quickstart --check"
+        "       buzz-axiru doctor"
       ].join("\n");
     case "claude-code":
       return [
@@ -194,7 +201,7 @@ export function harnessNextSteps(harness: string): string {
         "       claude mcp add buzz-axiru -- buzz-axiru serve",
         "  2. Restart Claude Code (or start a new session).",
         "  3. Prove it works:",
-        "       buzz-axiru quickstart --check"
+        "       buzz-axiru doctor"
       ].join("\n");
     case "codex":
       return [
@@ -207,7 +214,7 @@ export function harnessNextSteps(harness: string): string {
         "",
         "  2. Restart Codex.",
         "  3. Prove it works:",
-        "       buzz-axiru quickstart --check"
+        "       buzz-axiru doctor"
       ].join("\n");
     default:
       throw new Error(`unknown harness "${harness}" (use ${HARNESSES.join(", ")})`);

@@ -10,6 +10,7 @@
  *   buzz-axiru pending               list approvals waiting on a human
  *   buzz-axiru approve <id>          grant a pending approval
  *   buzz-axiru deny <id>             deny a pending approval
+ *   buzz-axiru reconcile <id>        resolve an ambiguous approved execution
  *   buzz-axiru verify                re-derive the ledger hash chain
  *
  * Flags: --mode gate|advisory  --policies <path>  --data-dir <path>
@@ -20,16 +21,23 @@
  * Licensed under the Apache License, Version 2.0.
  */
 
-import { existsSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 import { isExpired } from "./approvals.js";
-import { isGatedTool, loadConfig } from "./config.js";
+import {
+  isGatedTool,
+  isPlausiblePubkey,
+  loadConfig,
+  mappingForTool,
+  policiesForAgent
+} from "./config.js";
 import { GateServer } from "./gate.js";
 import { Bridge } from "./guard.js";
 import { verifyLedger } from "./ledger.js";
+import { withDataDirLock } from "./lock.js";
 import { LATEST_PROTOCOL_VERSION, McpServer } from "./mcp.js";
-import { notifyApprovalDecided } from "./notify.js";
+import { formatAmount, notifyApprovalDecided } from "./notify.js";
 import { DownstreamPool } from "./pool.js";
 import {
   buildQuickstartPolicies,
@@ -40,13 +48,23 @@ import {
 } from "./quickstart.js";
 import { STARTER_POLICIES } from "./scaffold.js";
 
-const VERSION = "0.3.1";
+const VERSION = "0.4.0";
 
 interface ParsedArgs {
   command: string;
   positional: string[];
   flags: Record<string, string>;
 }
+
+const BOOLEAN_FLAGS = new Set([
+  "help",
+  "version",
+  "force",
+  "yes",
+  "check",
+  "json",
+  "ack-unknown-amount"
+]);
 
 function parseArgs(argv: string[]): ParsedArgs {
   const flags: Record<string, string> = {};
@@ -56,9 +74,14 @@ function parseArgs(argv: string[]): ParsedArgs {
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
     if (arg.startsWith("--")) {
+      const equals = arg.indexOf("=");
+      if (equals > 2) {
+        flags[arg.slice(2, equals)] = arg.slice(equals + 1);
+        continue;
+      }
       const key = arg.slice(2);
       const value = argv[i + 1];
-      if (value === undefined || value.startsWith("--")) {
+      if (BOOLEAN_FLAGS.has(key) || value === undefined || value.startsWith("--")) {
         flags[key] = "true";
       } else {
         flags[key] = value;
@@ -87,7 +110,8 @@ function runInit(flags: Record<string, string>): void {
         "Nothing was written."
     );
   }
-  writeFileSync(path, STARTER_POLICIES, "utf8");
+  writeFileSync(path, STARTER_POLICIES, { encoding: "utf8", mode: 0o600 });
+  chmodSync(path, 0o600);
   process.stdout.write(
     [
       `Wrote ${path}`,
@@ -108,7 +132,7 @@ function runInit(flags: Record<string, string>): void {
 }
 
 /**
- * `buzz-axiru quickstart`: the one-command install. Detects the shell
+ * `buzz-axiru quickstart`: secure starter setup. Detects the shell
  * MCP server, writes a working policies.json, and prints the wiring
  * steps for the chosen harness. Non-interactive: every choice has a
  * flag, and --yes exists so scripts can state "defaults accepted"
@@ -122,13 +146,23 @@ function runQuickstart(flags: Record<string, string>): void {
     );
   }
   const detected = detectBuzzDevMcp();
+  const agentPubkey = flags["agent-pubkey"] ?? process.env.BUZZ_AXIRU_AGENT_PUBKEY ?? null;
+  if (agentPubkey !== null && !isPlausiblePubkey(agentPubkey)) {
+    fail(
+      "buzz-axiru quickstart: --agent-pubkey must be a 64-character lowercase hex Nostr pubkey or npub"
+    );
+  }
   // The shell entry is Buzz's bundled server. Other harnesses bring
   // their own tools, so their config starts in advisory mode with the
   // payment slot ready to move into the downstream array.
   const shell = harness === "buzz" ? detected : null;
   const path = resolve(flags.path ?? "policies.json");
   try {
-    writeQuickstartPolicies(path, buildQuickstartPolicies(shell), flags.force === "true");
+    writeQuickstartPolicies(
+      path,
+      buildQuickstartPolicies(shell, agentPubkey),
+      flags.force === "true"
+    );
   } catch (err) {
     fail(`buzz-axiru quickstart: ${(err as Error).message}`);
   }
@@ -144,6 +178,11 @@ function runQuickstart(flags: Record<string, string>): void {
     );
   }
   lines.push("", `Wrote ${path}`);
+  lines.push(
+    agentPubkey === null
+      ? "  agent identity: MISSING - set agent_pubkey or BUZZ_AXIRU_AGENT_PUBKEY before gate mode"
+      : `  agent identity: ${agentPubkey}`
+  );
   if (shell !== null) {
     lines.push(
       `  downstream:    shell (${shell.command}), tools exposed with their plain names`,
@@ -178,12 +217,15 @@ function runQuickstart(flags: Record<string, string>): void {
  */
 async function runQuickstartCheck(flags: Record<string, string>): Promise<void> {
   const config = loadConfig(flags.policies, flags["data-dir"]);
-  process.stdout.write(`buzz-axiru ${VERSION} check\npolicies: ${config.config_path}\n\n`);
+  process.stdout.write(`buzz-axiru ${VERSION} security readiness check\npolicies: ${config.config_path}\n\n`);
   if (config.downstream === null) {
     process.stdout.write(
-      "downstream: null (advisory mode; no servers to start)\n" +
-        "Config loads. Add a downstream server to run the enforcing gate.\n"
+      "[PASS] Config loads.\n" +
+        "[NOT READY] downstream is null: advisory mode does not enforce payment policy.\n" +
+        "Move the $downstream_payment_slot into downstream, configure its tool mappings,\n" +
+        "set agent_pubkey (or BUZZ_AXIRU_AGENT_PUBKEY), then run this check again.\n"
     );
+    process.exitCode = 1;
     return;
   }
   const pool = new DownstreamPool(config.downstream);
@@ -212,7 +254,53 @@ async function runQuickstartCheck(flags: Record<string, string>): Promise<void> 
           "only the tools that move money.\n"
       );
     }
-    process.stdout.write("OK: every downstream server started and answered tools/list.\n");
+    const blockers: string[] = [];
+    const warnings: string[] = [];
+    const identity = process.env.BUZZ_AXIRU_AGENT_PUBKEY ?? config.agent_pubkey;
+    if (identity === null || identity === undefined) {
+      blockers.push(
+        "No agent identity is configured. Set agent_pubkey or BUZZ_AXIRU_AGENT_PUBKEY."
+      );
+    } else if (!isPlausiblePubkey(identity)) {
+      blockers.push("BUZZ_AXIRU_AGENT_PUBKEY is not a valid hex pubkey or npub.");
+    }
+    if (config.payment_tools !== null && gated.length === 0) {
+      blockers.push(
+        "No exposed tool matches payment_tools.gate. Nothing is currently protected."
+      );
+    }
+    if (policiesForAgent(config, identity ?? "0".repeat(64)).length === 0) {
+      blockers.push("No spend controls are configured; the policy engine would default to allow.");
+    }
+    const unmapped = gated.filter((name) => mappingForTool(config, name)?.amount_field === undefined);
+    if (unmapped.length > 0) {
+      warnings.push(
+        `${unmapped.length} gated tool(s) have no amount mapping and will always require manual approval: ` +
+          unmapped.join(", ")
+      );
+    }
+    const fullEnv = config.downstream.filter((server) => server.env_passthrough === "all");
+    if (fullEnv.length > 0) {
+      warnings.push(
+        `Full environment inheritance is enabled for: ${fullEnv.map((s) => s.name).join(", ")}. ` +
+          "Use none or an explicit variable allowlist to isolate credentials."
+      );
+    }
+    if (config.buzz.channel_id === null && config.webhook_url === null) {
+      warnings.push(
+        "No Buzz channel or webhook is configured; approval requests are visible only in local stderr."
+      );
+    }
+    for (const warning of warnings) process.stdout.write(`[WARN] ${warning}\n`);
+    if (blockers.length > 0) {
+      for (const blocker of blockers) process.stdout.write(`[NOT READY] ${blocker}\n`);
+      process.stdout.write("\nDownstream connectivity passed, but the enforcing setup is not ready.\n");
+      process.exitCode = 1;
+    } else {
+      process.stdout.write("\n[PASS] Every downstream server started and answered tools/list.\n");
+      process.stdout.write("[PASS] Agent identity and gate coverage are configured.\n");
+      process.stdout.write("READY: start the enforcing gate with `buzz-axiru serve`.\n");
+    }
   } catch (err) {
     process.stdout.write(`FAILED: ${(err as Error).message}\n`);
     process.exitCode = 1;
@@ -224,11 +312,11 @@ async function runQuickstartCheck(flags: Record<string, string>): Promise<void> 
 async function main(): Promise<void> {
   const { command, positional, flags } = parseArgs(process.argv.slice(2));
 
-  if (command === "--version" || command === "version") {
+  if (flags.version === "true" || command === "version") {
     process.stdout.write(`buzz-axiru ${VERSION}\n`);
     return;
   }
-  if (command === "--help" || command === "help") {
+  if (flags.help === "true" || command === "help") {
     process.stdout.write(
       [
         `buzz-axiru ${VERSION}: bounded spend authority for Buzz agents`,
@@ -240,16 +328,22 @@ async function main(): Promise<void> {
         "  buzz-axiru init              write a starter policies.json in the current directory",
         "  buzz-axiru quickstart        detect your setup, write policies.json, print wiring",
         "                               steps (--harness buzz|goose|claude-code|codex, --yes,",
-        "                               --force); --check starts the configured downstream",
+        "                               --agent-pubkey <pubkey>, --force); --check starts the configured downstream",
         "                               servers, reports tool counts, and exits 0/1",
+        "  buzz-axiru doctor            run the same security-readiness and connectivity check",
         "  buzz-axiru pending           list approvals waiting on a human",
+        "  buzz-axiru show <id>         inspect one approval and its exact parked call",
         "  buzz-axiru approve <id>      grant a pending approval",
         "  buzz-axiru deny <id>         deny a pending approval",
+        "  buzz-axiru reconcile <id>    record an ambiguous execution as executed or failed",
         "  buzz-axiru verify            re-derive the decision ledger hash chain",
         "",
         "Flags: --mode gate|advisory  --policies <path>  --data-dir <path>",
         "       --by <name>  --note <text>  --force (init, quickstart)",
+        "       --json (pending)  --ack-unknown-amount (approve)",
+        "       --outcome executed|failed --note <evidence> (reconcile)",
         "       --harness buzz|goose|claude-code|codex  --yes  --check (quickstart)",
+        "       --agent-pubkey <hex-or-npub> (quickstart)",
         ""
       ].join("\n")
     );
@@ -267,6 +361,11 @@ async function main(): Promise<void> {
     } else {
       runQuickstart(flags);
     }
+    return;
+  }
+
+  if (command === "doctor") {
+    await runQuickstartCheck(flags);
     return;
   }
 
@@ -304,7 +403,7 @@ async function main(): Promise<void> {
       process.on("SIGINT", () => process.exit(130));
       process.on("SIGTERM", () => process.exit(143));
       await gate.start();
-      // Sweep the queue so granted parked calls are replayed and
+      // Sweep the queue so granted parked calls are executed and
       // overdue approvals expire even while the agent is idle.
       const sweeper = setInterval(() => {
         gate.processApprovals().catch((err) => {
@@ -321,56 +420,285 @@ async function main(): Promise<void> {
       return;
     }
     case "pending": {
-      process.stdout.write(JSON.stringify(bridge.approvals.pending(), null, 2) + "\n");
+      const pending = bridge.approvals.pending();
+      // A granted call stuck in_progress is not "pending" in the store,
+      // but it is exactly what an operator running this command needs
+      // to see: an ambiguous execution that only reconcile can resolve.
+      const unreconciled = bridge.approvals
+        .all()
+        .filter((a) => a.status === "granted" && a.execution_status === "in_progress");
+      if (flags.json === "true") {
+        process.stdout.write(JSON.stringify(pending, null, 2) + "\n");
+        return;
+      }
+      if (pending.length === 0 && unreconciled.length === 0) {
+        process.stdout.write("No approvals are waiting.\n");
+        return;
+      }
+      if (pending.length > 0) {
+        process.stdout.write(`${pending.length} approval${pending.length === 1 ? "" : "s"} waiting:\n\n`);
+        for (const approval of pending) {
+          process.stdout.write(
+            [
+              `${approval.approval_id}  ${formatAmount(approval.amount_minor_units, approval.currency)}`,
+              `  counterparty: ${approval.counterparty}`,
+              `  tool:         ${approval.call?.tool_name ?? "advisory request"}`,
+              `  requested:    ${approval.requested_at}`,
+              `  expires:      ${approval.expires_at ?? "never"}`,
+              `  inspect:      buzz-axiru show ${approval.approval_id}`,
+              ""
+            ].join("\n")
+          );
+        }
+      }
+      if (unreconciled.length > 0) {
+        process.stdout.write(
+          `${unreconciled.length} approved execution${unreconciled.length === 1 ? "" : "s"} ` +
+            "NEED MANUAL RECONCILIATION (claimed but no recorded outcome; never retried automatically):\n\n"
+        );
+        for (const approval of unreconciled) {
+          process.stdout.write(
+            [
+              `${approval.approval_id}  ${formatAmount(approval.amount_minor_units, approval.currency)}`,
+              `  counterparty: ${approval.counterparty}`,
+              `  tool:         ${approval.call?.tool_name ?? "advisory request"}`,
+              `  claimed:      ${approval.execution_started_at ?? "unknown"}`,
+              `  inspect:      buzz-axiru show ${approval.approval_id}`,
+              `  resolve:      buzz-axiru reconcile ${approval.approval_id} --outcome executed|failed --note <evidence>`,
+              ""
+            ].join("\n")
+          );
+        }
+      }
+      return;
+    }
+    case "show": {
+      const id = positional[0];
+      if (!id) fail("buzz-axiru show: missing approval id (see: buzz-axiru pending)");
+      if (!/^(?:[0-9a-f]{12}|[0-9a-f]{32})$/.test(id)) {
+        fail("buzz-axiru show: approval id must be 12 or 32 lowercase hex characters");
+      }
+      const approval = bridge.approvals.get(id);
+      if (!approval) fail(`buzz-axiru show: no approval with id ${id}`);
+      if (flags.json === "true") {
+        process.stdout.write(JSON.stringify(approval, null, 2) + "\n");
+        return;
+      }
+      process.stdout.write(
+        [
+          `Approval ${approval.approval_id}`,
+          `  status:       ${approval.status}`,
+          `  amount:       ${formatAmount(approval.amount_minor_units, approval.currency)} (${approval.amount_minor_units} minor units)`,
+          `  counterparty: ${approval.counterparty}`,
+          `  agent:        ${approval.agent_pubkey}`,
+          `  reason:       ${approval.reason_code}`,
+          `  requested:    ${approval.requested_at}`,
+          `  expires:      ${approval.expires_at ?? "never"}`,
+          `  tool:         ${approval.call?.tool_name ?? "advisory request"}`,
+          "",
+          ...(approval.call !== undefined
+            ? ["Exact parked arguments:", JSON.stringify(approval.call.arguments, null, 2), ""]
+            : []),
+          ...(approval.amount_minor_units === "unknown"
+            ? [
+                "WARNING: Axiru could not extract the amount. Verify the exact arguments above.",
+                `Approval requires: buzz-axiru approve ${approval.approval_id} --ack-unknown-amount`,
+                ""
+              ]
+            : []),
+          `Approve: buzz-axiru approve ${approval.approval_id} --by <name>`,
+          `Deny:    buzz-axiru deny ${approval.approval_id} --by <name>`,
+          ""
+        ].join("\n")
+      );
+      return;
+    }
+    case "reconcile": {
+      const id = positional[0];
+      if (!id) fail("buzz-axiru reconcile: missing approval id (see: buzz-axiru pending)");
+      if (!/^(?:[0-9a-f]{12}|[0-9a-f]{32})$/.test(id)) {
+        fail("buzz-axiru reconcile: approval id must be 12 or 32 lowercase hex characters");
+      }
+      const finalStatus = flags.outcome;
+      if (finalStatus !== "executed" && finalStatus !== "failed") {
+        fail("buzz-axiru reconcile: --outcome must be executed or failed");
+      }
+      const decidedBy = flags.by ?? "operator";
+      if (
+        decidedBy.length === 0 ||
+        decidedBy.length > 100 ||
+        /[\u0000-\u001f\u007f-\u009f]/.test(decidedBy)
+      ) {
+        fail("buzz-axiru reconcile: --by must be 1-100 printable characters");
+      }
+      const note = flags.note;
+      if (note === undefined || note.trim().length === 0 || note.length > 1_000) {
+        fail(
+          "buzz-axiru reconcile: --note is required (1-1000 characters; include provider evidence)"
+        );
+      }
+      const now = new Date();
+      const outcome = withDataDirLock(config.data_dir, () => {
+        const current = bridge.approvals.get(id);
+        if (!current) throw new Error(`buzz-axiru: no approval with id ${id}`);
+        if (current.execution_status !== "in_progress" || current.status !== "granted") {
+          throw new Error(
+            `buzz-axiru: approval ${id} is not awaiting reconciliation ` +
+              `(status=${current.status}, execution=${current.execution_status ?? "not_started"})`
+          );
+        }
+        const record = bridge.ledger.append({
+          type: "execution",
+          actor: decidedBy,
+          agent_pubkey: current.agent_pubkey,
+          reason_code:
+            finalStatus === "executed"
+              ? "bridge.execution.reconciled_executed"
+              : "bridge.execution.reconciled_failed",
+          amount_minor_units: current.amount_minor_units,
+          currency: current.currency,
+          counterparty: current.counterparty,
+          memo: current.memo,
+          fingerprint: current.fingerprint,
+          ...(current.call !== undefined ? { tool_name: current.call.tool_name } : {}),
+          execution_status: finalStatus,
+          approval_id: current.approval_id,
+          ...(finalStatus === "failed" ? { error: note } : {}),
+          note,
+          ts: now.toISOString()
+        });
+        const approval =
+          finalStatus === "executed"
+            ? bridge.approvals.recordExecution(id, {
+                status: "executed",
+                result: {
+                  content: [
+                    {
+                      type: "text",
+                      text: JSON.stringify({
+                        status: "executed_after_manual_reconciliation",
+                        executed: true,
+                        approval_id: id,
+                        guidance:
+                          "An operator confirmed this payment with the provider. Do not issue it again."
+                      })
+                    }
+                  ],
+                  isError: false
+                },
+                at: now
+              })
+            : bridge.approvals.recordExecution(id, {
+                status: "failed",
+                error: note,
+                at: now
+              });
+        return { approval, record };
+      });
+      await notifyApprovalDecided(config, outcome.approval);
+      process.stdout.write(
+        JSON.stringify(
+          {
+            approval_id: outcome.approval.approval_id,
+            execution_status: outcome.approval.execution_status,
+            reconciled_by: decidedBy,
+            note,
+            ledger: { seq: outcome.record.seq, hash: outcome.record.hash }
+          },
+          null,
+          2
+        ) + "\n"
+      );
       return;
     }
     case "approve":
     case "deny": {
       const id = positional[0];
       if (!id) fail(`buzz-axiru ${command}: missing approval id (see: buzz-axiru pending)`);
+      if (!/^(?:[0-9a-f]{12}|[0-9a-f]{32})$/.test(id)) {
+        fail(`buzz-axiru ${command}: approval id must be 12 or 32 lowercase hex characters`);
+      }
       const now = new Date();
-      const overdue = bridge.approvals.get(id);
-      if (overdue && overdue.status === "pending" && isExpired(overdue, now)) {
-        const expired = bridge.approvals.markExpired(id, now);
-        if (expired) {
-          bridge.ledger.append({
+      const status: "granted" | "denied" = command === "approve" ? "granted" : "denied";
+      const decidedBy = flags.by ?? "operator";
+      if (
+        decidedBy.length === 0 ||
+        decidedBy.length > 100 ||
+        /[\u0000-\u001f\u007f-\u009f]/.test(decidedBy)
+      ) {
+        fail(`buzz-axiru ${command}: --by must be 1-100 printable characters`);
+      }
+      if (flags.note !== undefined && flags.note.length > 1_000) {
+        fail(`buzz-axiru ${command}: --note must be 1000 characters or fewer`);
+      }
+
+      const outcome = withDataDirLock(config.data_dir, () => {
+        const current = bridge.approvals.get(id);
+        if (!current) throw new Error(`buzz-axiru: no approval with id ${id}`);
+        if (current.status === "pending" && isExpired(current, now)) {
+          // Record the expiry before publishing the state transition.
+          const record = bridge.ledger.append({
             type: "approval_expired",
             actor: "bridge",
-            agent_pubkey: expired.agent_pubkey,
+            agent_pubkey: current.agent_pubkey,
             reason_code: "bridge.expired.approval_ttl",
-            amount_minor_units: expired.amount_minor_units,
-            currency: expired.currency,
-            counterparty: expired.counterparty,
-            memo: expired.memo,
-            fingerprint: expired.fingerprint,
-            approval_id: expired.approval_id,
-            ...(expired.call !== undefined ? { tool_name: expired.call.tool_name } : {}),
+            amount_minor_units: current.amount_minor_units,
+            currency: current.currency,
+            counterparty: current.counterparty,
+            memo: current.memo,
+            fingerprint: current.fingerprint,
+            approval_id: current.approval_id,
+            ...(current.call !== undefined ? { tool_name: current.call.tool_name } : {}),
             ts: now.toISOString()
           });
-          await notifyApprovalDecided(config, expired);
+          const expired = bridge.approvals.markExpired(id, now)!;
+          return { kind: "expired" as const, approval: expired, record };
         }
+        if (current.status !== "pending") {
+          throw new Error(
+            `buzz-axiru: approval ${id} was already ${current.status}` +
+              (current.decided_by !== undefined ? ` by ${current.decided_by}` : "")
+          );
+        }
+        if (
+          status === "granted" &&
+          current.amount_minor_units === "unknown" &&
+          flags["ack-unknown-amount"] !== "true"
+        ) {
+          throw new Error(
+            `buzz-axiru: approval ${id} has an unknown amount. Inspect the exact call with ` +
+              `"buzz-axiru show ${id}", then repeat with --ack-unknown-amount only if it is safe.`
+          );
+        }
+        // Write the human decision to the tamper-evident ledger before
+        // making a grant visible to the gate's execution sweeper.
+        const record = bridge.ledger.append({
+          type: status === "granted" ? "approval_granted" : "approval_denied",
+          actor: decidedBy,
+          agent_pubkey: current.agent_pubkey,
+          reason_code: status === "granted" ? "bridge.approval.granted" : "bridge.approval.denied",
+          amount_minor_units: current.amount_minor_units,
+          currency: current.currency,
+          counterparty: current.counterparty,
+          memo: current.memo,
+          fingerprint: current.fingerprint,
+          approval_id: current.approval_id,
+          ...(current.call !== undefined ? { tool_name: current.call.tool_name } : {}),
+          ...(flags.note !== undefined ? { note: flags.note } : {}),
+          ts: now.toISOString()
+        });
+        const approval = bridge.approvals.decide(id, status, decidedBy, flags.note, now);
+        return { kind: "decided" as const, approval, record };
+      });
+
+      if (outcome.kind === "expired") {
+        await notifyApprovalDecided(config, outcome.approval);
         fail(
-          `buzz-axiru ${command}: approval ${id} expired at ${overdue.expires_at} ` +
+          `buzz-axiru ${command}: approval ${id} expired at ${outcome.approval.expires_at} ` +
             "and can no longer be decided. It was never executed."
         );
       }
-      const status = command === "approve" ? "granted" : "denied";
-      const decidedBy = flags.by ?? "operator";
-      const approval = bridge.approvals.decide(id, status, decidedBy, flags.note, now);
-      const record = bridge.ledger.append({
-        type: status === "granted" ? "approval_granted" : "approval_denied",
-        actor: decidedBy,
-        agent_pubkey: approval.agent_pubkey,
-        reason_code: status === "granted" ? "bridge.approval.granted" : "bridge.approval.denied",
-        amount_minor_units: approval.amount_minor_units,
-        currency: approval.currency,
-        counterparty: approval.counterparty,
-        memo: approval.memo,
-        fingerprint: approval.fingerprint,
-        approval_id: approval.approval_id,
-        ...(approval.call !== undefined ? { tool_name: approval.call.tool_name } : {}),
-        ...(flags.note !== undefined ? { note: flags.note } : {})
-      });
+      const { approval, record } = outcome;
       await notifyApprovalDecided(config, approval);
       process.stdout.write(
         JSON.stringify(
@@ -392,8 +720,9 @@ async function main(): Promise<void> {
       if (status === "granted" && approval.call !== undefined) {
         process.stderr.write(
           "buzz-axiru: this approval is a parked tool call; the running gate " +
-            "process will execute it against the downstream server within a few " +
-            "seconds and record the outcome in the ledger.\n"
+            "process will durably claim it, execute it at most once, and record the " +
+            "outcome. If the process dies mid-call, Axiru will require manual " +
+            "reconciliation instead of risking a duplicate payment.\n"
         );
       }
       return;

@@ -20,15 +20,21 @@ import {
   writeQuickstartPolicies,
   HARNESSES
 } from "../src/quickstart.js";
+import { AGENT_PUBKEY } from "./helpers.js";
 
 function tempDir(): string {
   return mkdtempSync(join(tmpdir(), "buzz-axiru-quickstart-"));
 }
 
-test("generated config is valid JSON and loads through loadConfig", () => {
-  const content = buildQuickstartPolicies({ command: "buzz-dev-mcp", source: "PATH (/usr/local/bin/buzz-dev-mcp)" });
+test("generated config is valid, credential-free, and loads through loadConfig", () => {
+  const content = buildQuickstartPolicies(
+    { command: "buzz-dev-mcp", source: "PATH (/usr/local/bin/buzz-dev-mcp)" },
+    AGENT_PUBKEY
+  );
   const parsed = JSON.parse(content) as Record<string, unknown>;
   assert.ok(Array.isArray(parsed.downstream), "downstream should be an array");
+  assert.doesNotMatch(content, /sk_(?:test|live)_/);
+  assert.equal(parsed.agent_pubkey, AGENT_PUBKEY);
 
   const dir = tempDir();
   const path = join(dir, "policies.json");
@@ -41,6 +47,7 @@ test("generated config is valid JSON and loads through loadConfig", () => {
   assert.equal(shell.name, "shell");
   assert.equal(shell.command, "buzz-dev-mcp");
   assert.equal(shell.tool_prefix, "");
+  assert.deepEqual(shell.env_passthrough, ["PATH", "HOME", "TMPDIR"]);
   assert.ok(config.payment_tools !== null);
   assert.deepEqual(config.payment_tools.gate, ["pay_*"]);
   // The whole point of the pay_ split: money tools gated, shell tools not.
@@ -48,6 +55,15 @@ test("generated config is valid JSON and loads through loadConfig", () => {
   assert.equal(isGatedTool(config, "run_shell_command"), false);
   // The disabled payment slot must stay a $-key, invisible to the loader.
   assert.ok("$downstream_payment_slot" in parsed);
+  const paymentSlot = parsed.$downstream_payment_slot as Record<string, unknown>;
+  assert.deepEqual(paymentSlot.env, {});
+  assert.match(JSON.stringify(paymentSlot.args), /PIN_REVIEWED_VERSION/);
+  assert.deepEqual(paymentSlot.env_passthrough, [
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    "STRIPE_SECRET_KEY"
+  ]);
 });
 
 test("generated config without a shell server loads in advisory mode", () => {
@@ -58,6 +74,15 @@ test("generated config without a shell server loads in advisory mode", () => {
   const config = loadConfig(path, join(dir, "data"));
   assert.equal(config.downstream, null);
   assert.ok(config.payment_tools !== null, "matcher stays ready for gate mode");
+});
+
+test("the disabled payment slot must be explicitly version-pinned before enabling", () => {
+  const parsed = JSON.parse(buildQuickstartPolicies(null)) as Record<string, unknown>;
+  parsed.downstream = [parsed.$downstream_payment_slot];
+  const dir = tempDir();
+  const path = join(dir, "policies.json");
+  writeFileSync(path, JSON.stringify(parsed), "utf8");
+  assert.throws(() => loadConfig(path, join(dir, "data")), /still contains PIN_REVIEWED_VERSION/);
 });
 
 test("refuses to overwrite an existing policies.json without force", () => {
@@ -85,7 +110,7 @@ test("harness snippet selection covers every harness and rejects junk", () => {
   assert.ok(codex.includes("[mcp_servers.buzz-axiru]"));
   assert.ok(codex.includes("~/.codex/config.toml"));
   for (const harness of HARNESSES) {
-    assert.ok(harnessNextSteps(harness).includes("buzz-axiru quickstart --check"));
+    assert.ok(harnessNextSteps(harness).includes("buzz-axiru doctor"));
   }
   assert.throws(() => harnessNextSteps("aider"), /unknown harness "aider"/);
 });
