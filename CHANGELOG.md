@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.5.1
+
+Onboarding release: `buzz-axiru adopt`, the missing wiring step for Buzz
+Desktop users.
+
+Field finding that motivated it: Buzz Desktop gives imported and custom
+agents an empty `mcp_command` and exposes no UI to set it, and
+`BUZZ_ACP_MCP_COMMAND` is on the app's reserved environment variable list,
+so the env-var instructions (README step 3, quickstart output) silently do
+nothing under the Desktop app. The only working path is editing the app's
+`managed-agents.json` while the app is closed. Evidence: the reserved-list
+error string in the buzz-desktop binary; UserProfilePanel renders
+`mcpCommand` read-only and hides it when empty; the edit-agent dialog and
+the custom-harness form contain zero `mcpCommand` references; agents get
+`mcpCommand` copied from the runtime definition at creation. A ready-to-file
+upstream issue lives in `GITHUB-ISSUE-BUZZ.md`.
+
+New:
+
+- `buzz-axiru adopt [--agent <name>] [--data <path>] [--unset] [--dry-run]
+  [--yes]` sets an agent's mcp command to `buzz-axiru` inside Buzz Desktop's
+  `managed-agents.json` (`--unset` restores the empty string):
+  - Refuses to run while Buzz Desktop is running (POSIX process scan; the
+    app live-rewrites the file, so editing under it corrupts state). Fails
+    closed when the process table cannot be read. `--force` overrides,
+    loudly discouraged.
+  - Locates the file via `--data`, else one glob level under the standard
+    locations (macOS: `~/Library/Application Support/Buzz*/` and
+    `~/.buzz*/`; Linux: `~/.config/buzz*/` and `~/.buzz*/`). Multiple hits
+    are listed and require `--data`; zero hits print instructions to ask a
+    shell-capable Buzz agent for the path.
+  - Tolerates unknown file shapes (top-level array, keyed object, either
+    the `mcp_command` or `mcpCommand` spelling; the spelling found is the
+    spelling edited). An unrecognizable shape is refused with a structural
+    description that contains no values from the file.
+  - Writes a timestamped backup next to the file before any edit, previews
+    the change, and requires a TTY confirmation or `--yes`. Re-serializes
+    with 2-space indent, so formatting may normalize; the backup keeps the
+    original bytes.
+- `quickstart --harness buzz` next steps now split the two wiring paths:
+  the env var for raw `buzz-acp`, `adopt` for Buzz Desktop.
+- README onboarding rewritten around the same split.
+
 ## 0.5.0
 
 Security release. Most items originate from an external deep security review

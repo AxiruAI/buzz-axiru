@@ -46,7 +46,7 @@ Goose / Codex / Claude Code  (harnessed by buzz-acp)
 
 ## Quickstart
 
-Node 18 or newer. Generate a secure starter config and wire it to your
+Node 22 or newer. Generate a secure starter config and wire it to your
 harness:
 
 ```bash
@@ -60,13 +60,56 @@ PATH, then the macOS app bundle), writes a starter `policies.json` in the
 current directory, and prints the wiring steps for your harness. It never
 prompts: every choice has a flag (`--harness buzz|goose|claude-code|codex`,
 `--agent-pubkey`, `--force` to overwrite an existing `policies.json`, `--yes`
-to accept all defaults). For Buzz the printed steps boil down to:
+to accept all defaults). For raw `buzz-acp` in a terminal the printed steps
+boil down to:
 
 ```bash
 export BUZZ_ACP_MCP_COMMAND=buzz-axiru
 # configure the disabled payment slot, then verify identity, coverage, and connectivity:
 buzz-axiru doctor
 ```
+
+Running the **Buzz Desktop app** instead? That env var will not work: the app
+keeps `BUZZ_ACP_MCP_COMMAND` on its reserved list and offers no UI field for
+an agent's mcp command. Use `buzz-axiru adopt` (next section) in place of the
+export.
+
+### Buzz Desktop: `buzz-axiru adopt`
+
+Buzz Desktop creates imported and custom agents with an empty `mcp_command`
+and no way to change it in the app: the profile panel shows the field
+read-only (and hides it when empty), the edit-agent dialog has no input for
+it, and the reserved-variable list blocks `BUZZ_ACP_MCP_COMMAND`. The one
+working wiring point is the app's own `managed-agents.json`, edited while the
+app is closed. `adopt` does that edit safely:
+
+```bash
+# 1. Quit Buzz Desktop completely (adopt refuses to run while it is open:
+#    the app rewrites managed-agents.json live, and editing under it can
+#    corrupt your agent store).
+# 2. Point the agent at the gate:
+buzz-axiru adopt --agent <name>
+# 3. Reopen Buzz, restart the agent, then prove the gate is live:
+buzz-axiru quickstart --check
+```
+
+Then ask in the agent's channel: `@Axiru confirm your gate is live`.
+
+`adopt` finds `managed-agents.json` in the standard Buzz Desktop locations
+(macOS: `~/Library/Application Support/Buzz*/` and `~/.buzz*/`; Linux:
+`~/.config/buzz*/` and `~/.buzz*/`). If it finds several it lists them and
+asks you to pick one with `--data <path>`; if it finds none, ask a
+shell-capable Buzz agent where the file lives and pass `--data` yourself.
+Before writing anything it makes a timestamped backup next to the file,
+shows you the exact field change, and waits for confirmation (`--yes` for
+scripts, `--dry-run` to only look). `--unset` restores the empty
+`mcp_command` and takes the gate back out of the loop. Both field spellings
+(`mcp_command` and `mcpCommand`) are handled; whichever the file uses is the
+one edited. Note the file is re-serialized with 2-space indentation, so
+formatting may normalize; the backup keeps the original bytes.
+
+There is a ready-to-file upstream issue asking Buzz Desktop to expose the
+field in its UI: [GITHUB-ISSUE-BUZZ.md](GITHUB-ISSUE-BUZZ.md).
 
 `doctor` (also available as `quickstart --check`) loads the config, starts
 every configured downstream server exactly the way `serve` does, lists its
@@ -371,13 +414,19 @@ own audit chain then covers your spend chain.
    to the channel UUID where approvals should land. The bridge posts through
    the `buzz` CLI (`buzz messages send --channel <uuid> --content ...`), which
    must be on `PATH`.
-3. **Hand the gate to your agents.** `buzz-acp` accepts an MCP server binary
-   via `BUZZ_ACP_MCP_COMMAND` and provides it to each agent subprocess:
+3. **Hand the gate to your agents.** Raw `buzz-acp` accepts an MCP server
+   binary via `BUZZ_ACP_MCP_COMMAND` and provides it to each agent
+   subprocess:
 
    ```bash
    export BUZZ_ACP_MCP_COMMAND="$(which buzz-axiru)"
    buzz-acp
    ```
+
+   This env var does NOT work under the Buzz Desktop app, which reserves it
+   and exposes no UI field for an agent's mcp command. Desktop users: quit
+   Buzz, run `buzz-axiru adopt --agent <name>`, reopen Buzz. See
+   [Buzz Desktop: `buzz-axiru adopt`](#buzz-desktop-buzz-axiru-adopt).
 
 4. **Run one gate instance per agent** and set `BUZZ_AXIRU_AGENT_PUBKEY` to
    that agent's hex pubkey, so decisions and caps attach to the right

@@ -101,6 +101,10 @@ test("refuses to overwrite an existing policies.json without force", () => {
 test("harness snippet selection covers every harness and rejects junk", () => {
   const buzz = harnessNextSteps("buzz");
   assert.ok(buzz.includes("export BUZZ_ACP_MCP_COMMAND=buzz-axiru"));
+  // The env var is raw-buzz-acp-only; Desktop users must be routed to
+  // adopt, because the app reserves the variable and has no UI field.
+  assert.ok(buzz.includes("buzz-axiru adopt --agent <name>"));
+  assert.ok(buzz.includes("Quit Buzz Desktop"));
   const goose = harnessNextSteps("goose");
   assert.ok(goose.includes("~/.config/goose/config.yaml"));
   assert.ok(goose.includes("verify against your goose version"));

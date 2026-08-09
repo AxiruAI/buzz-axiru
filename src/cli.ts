@@ -7,6 +7,8 @@
  *   buzz-axiru init                  write a starter policies.json here
  *   buzz-axiru quickstart            detect your setup, write policies.json,
  *                                    print wiring steps; --check verifies it
+ *   buzz-axiru adopt                 point a Buzz Desktop agent at the gate
+ *                                    (edits managed-agents.json; app closed)
  *   buzz-axiru pending               list approvals waiting on a human
  *   buzz-axiru approve <id>          grant a pending approval
  *   buzz-axiru deny <id>             deny a pending approval
@@ -21,9 +23,20 @@
  * Licensed under the Apache License, Version 2.0.
  */
 
-import { chmodSync, existsSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { createInterface } from "node:readline/promises";
 
+import {
+  describeStructure,
+  findManagedAgentsFiles,
+  locateAgents,
+  managedAgentsSearchRoots,
+  refuseIfBuzzDesktopRunning,
+  setAgentMcpCommand,
+  writeBackup
+} from "./adopt.js";
 import { isExpired } from "./approvals.js";
 import {
   isGatedTool,
@@ -48,7 +61,7 @@ import {
 } from "./quickstart.js";
 import { STARTER_POLICIES } from "./scaffold.js";
 
-const VERSION = "0.5.0";
+const VERSION = "0.5.1";
 
 interface ParsedArgs {
   command: string;
@@ -63,7 +76,9 @@ const BOOLEAN_FLAGS = new Set([
   "yes",
   "check",
   "json",
-  "ack-unknown-amount"
+  "ack-unknown-amount",
+  "unset",
+  "dry-run"
 ]);
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -329,6 +344,148 @@ async function runQuickstartCheck(flags: Record<string, string>): Promise<void> 
   }
 }
 
+/**
+ * `buzz-axiru adopt`: edit Buzz Desktop's managed-agents.json to route
+ * an agent's tools through the gate. This exists because the Desktop
+ * app gives imported and custom agents an empty mcp_command, offers no
+ * UI field to change it, and reserves the BUZZ_ACP_MCP_COMMAND env var;
+ * the file is the only remaining wiring point, and it is only safe to
+ * edit while the app is closed.
+ */
+async function runAdopt(flags: Record<string, string>): Promise<void> {
+  if (flags.force === "true") {
+    process.stderr.write(
+      "buzz-axiru adopt: --force skips the Buzz-Desktop-is-closed check. If the " +
+        "app is open, this edit can be overwritten or corrupt the agent store.\n"
+    );
+  }
+  const refusal = refuseIfBuzzDesktopRunning(flags.force === "true");
+  if (refusal !== null) fail(refusal);
+
+  // Locate the file: explicit --data wins; otherwise search the standard
+  // Buzz Desktop data directories, refusing to guess between multiple hits.
+  let path: string;
+  if (flags.data !== undefined) {
+    path = resolve(flags.data);
+    if (!existsSync(path)) fail(`buzz-axiru adopt: --data ${path} does not exist`);
+  } else {
+    const roots = managedAgentsSearchRoots(homedir(), process.platform);
+    const found = findManagedAgentsFiles(homedir(), process.platform);
+    if (found.length === 0) {
+      fail(
+        [
+          "buzz-axiru adopt: no managed-agents.json found. Searched (one glob level):",
+          ...roots.map((root) => `  ${root.display}`),
+          "Your Buzz install keeps it somewhere else. Ask a shell-capable Buzz agent",
+          "to run:",
+          "  find ~ -maxdepth 5 -name managed-agents.json 2>/dev/null",
+          "then pass the path explicitly:",
+          "  buzz-axiru adopt --agent <name> --data <path-to-managed-agents.json>"
+        ].join("\n")
+      );
+    }
+    if (found.length > 1) {
+      fail(
+        [
+          "buzz-axiru adopt: multiple managed-agents.json files found:",
+          ...found.map((hit) => `  ${hit}`),
+          "Pick the one your Buzz Desktop actually uses and pass it with --data."
+        ].join("\n")
+      );
+    }
+    path = found[0]!;
+  }
+
+  const raw = readFileSync(path, "utf8");
+  let doc: unknown;
+  try {
+    doc = JSON.parse(raw);
+  } catch (err) {
+    fail(
+      `buzz-axiru adopt: ${path} is not valid JSON (${(err as Error).message}). ` +
+        "Refusing to touch it; restore it from a Buzz backup first."
+    );
+  }
+  const collection = locateAgents(doc);
+  if (collection === null) {
+    // Structural description only, never file contents: the store can
+    // hold tokens that must not end up in a terminal scrollback.
+    fail(
+      "buzz-axiru adopt: could not recognize the agents collection in " +
+        `${path}. The file's structure is: ${describeStructure(doc)}. ` +
+        "Refusing to guess; file an issue with this structural description " +
+        "(it contains no values from your file)."
+    );
+  }
+
+  const next = flags.unset === "true" ? "" : "buzz-axiru";
+  let edit;
+  try {
+    edit = setAgentMcpCommand(collection, flags.agent ?? null, next);
+  } catch (err) {
+    fail(`buzz-axiru adopt: ${(err as Error).message}`);
+  }
+
+  const spelling = edit.keys.join(" and ");
+  process.stdout.write(
+    [
+      `${path}`,
+      `  agents collection: ${collection.location}`,
+      `  agent:             ${edit.agentName}`,
+      `  field:             ${spelling}`,
+      `  change:            ${JSON.stringify(edit.previous)} -> ${JSON.stringify(edit.next)}`,
+      "  note:              the file is re-serialized with 2-space indent, so",
+      "                     formatting may normalize; a timestamped backup is",
+      "                     written next to it first",
+      ""
+    ].join("\n")
+  );
+
+  if (flags["dry-run"] === "true") {
+    process.stdout.write("Dry run: nothing was written.\n");
+    return;
+  }
+  if (flags.yes !== "true") {
+    // No TTY means nobody can answer the prompt; require --yes so a
+    // script cannot silently rewrite Buzz's state file.
+    if (!process.stdin.isTTY || !process.stdout.isTTY) {
+      fail("buzz-axiru adopt: not a terminal; re-run with --yes to apply this change.");
+    }
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const answer = (await rl.question("Apply this change? [y/N] ")).trim().toLowerCase();
+    rl.close();
+    if (answer !== "y" && answer !== "yes") {
+      fail("buzz-axiru adopt: aborted; nothing was written.");
+    }
+  }
+
+  const backup = writeBackup(path);
+  // Preserve the file's own permission bits: the store is Buzz's file,
+  // and tightening or loosening its mode is not this command's call.
+  const mode = statSync(path).mode & 0o777;
+  writeFileSync(path, JSON.stringify(doc, null, 2) + "\n", { encoding: "utf8", mode });
+  chmodSync(path, mode);
+  process.stdout.write(
+    [
+      `Backup:  ${backup}`,
+      `Updated: ${path}`,
+      "",
+      "Next steps:",
+      "  1. Reopen Buzz Desktop.",
+      `  2. Restart the agent (${edit.agentName}) so it picks up the change.`,
+      ...(flags.unset === "true"
+        ? ["  3. The agent's mcp command is empty again; the gate is out of the loop."]
+        : [
+            "  3. Prove the gate is live:",
+            "       buzz-axiru quickstart --check",
+            "  4. In the agent's channel, ask:",
+            "       @Axiru confirm your gate is live"
+          ]),
+      ""
+    ].join("\n")
+  );
+}
+
 async function main(): Promise<void> {
   const { command, positional, flags } = parseArgs(process.argv.slice(2));
 
@@ -351,6 +508,9 @@ async function main(): Promise<void> {
         "                               --agent-pubkey <pubkey>, --force); --check starts the configured downstream",
         "                               servers, reports tool counts, and exits 0/1",
         "  buzz-axiru doctor            run the same security-readiness and connectivity check",
+        "  buzz-axiru adopt             point a Buzz Desktop managed agent at the gate by",
+        "                               editing the app's managed-agents.json (quit Buzz first;",
+        "                               --agent <name>, --data <path>, --unset, --dry-run, --yes)",
         "  buzz-axiru pending           list approvals waiting on a human",
         "  buzz-axiru show <id>         inspect one approval and its exact parked call",
         "  buzz-axiru approve <id>      grant a pending approval",
@@ -365,6 +525,7 @@ async function main(): Promise<void> {
         "       --outcome executed|failed --note <evidence> (reconcile)",
         "       --harness buzz|goose|claude-code|codex  --yes  --check (quickstart)",
         "       --agent-pubkey <hex-or-npub> (quickstart)",
+        "       --agent <name>  --data <path>  --unset  --dry-run  --yes (adopt)",
         ""
       ].join("\n")
     );
@@ -387,6 +548,11 @@ async function main(): Promise<void> {
 
   if (command === "doctor") {
     await runQuickstartCheck(flags);
+    return;
+  }
+
+  if (command === "adopt") {
+    await runAdopt(flags);
     return;
   }
 

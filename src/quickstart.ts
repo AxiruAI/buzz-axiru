@@ -169,12 +169,20 @@ export function writeQuickstartPolicies(path: string, content: string, force: bo
 export function harnessNextSteps(harness: string): string {
   switch (harness as Harness) {
     case "buzz":
+      // Two wiring paths on purpose: the env var only works for raw
+      // buzz-acp. Buzz Desktop keeps BUZZ_ACP_MCP_COMMAND on its
+      // reserved list and has no UI field for an agent's mcp command,
+      // so Desktop users must go through `buzz-axiru adopt` instead.
       return [
         "Next steps (buzz):",
-        "  1. Point Buzz at the gate:",
+        "  1. Raw buzz-acp (terminal): point it at the gate with",
         "       export BUZZ_ACP_MCP_COMMAND=buzz-axiru",
-        "  2. Restart the agent in Buzz. Its tools now route through the gate.",
-        "  3. Prove it works:",
+        "  2. Restart the agent. Its tools now route through the gate.",
+        "  3. Buzz Desktop instead? The app reserves that env var and has no UI",
+        "     field for it. Quit Buzz Desktop completely, run",
+        "       buzz-axiru adopt --agent <name>",
+        "     then reopen Buzz and restart the agent.",
+        "  4. Prove it works:",
         "       buzz-axiru doctor"
       ].join("\n");
     case "goose":
