@@ -30,7 +30,7 @@ import { verifyLedger } from "../src/ledger.js";
 import { approvalRequestText, formatAmount } from "../src/notify.js";
 
 const AGENT_PUBKEY = "b7a1c3d9e5f2064788a9b0c1d2e3f405162738495a6b7c8d9e0f1a2b3c4d5e6f";
-const VERSION = "0.4.0";
+const VERSION = "0.5.2";
 // Buzz launch day, 15:00 New York time: inside the business-hours window.
 const CLOCK = new Date("2026-07-21T15:00:00-04:00");
 const FAST = process.env.DEMO_FAST === "1";

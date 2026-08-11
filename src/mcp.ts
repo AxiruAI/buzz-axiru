@@ -61,6 +61,63 @@ export const TOOL_DEFINITION = {
   }
 } as const;
 
+export const STATUS_TOOL_NAME = "axiru_gate_status";
+
+/**
+ * Why this tool exists (field-verified, 0.5.2): an agent running under
+ * a Buzz custom harness cannot see the gate from inside. The
+ * --mcp-command wiring is an argv flag, so no environment variable
+ * betrays it, and in passthrough the tool names are identical to the
+ * ungated ones. Asked "is your gate live", agents therefore guessed,
+ * and guessed wrong. This tool is the evidence: it only exists when the
+ * gate is serving, and its payload names the policy file, the gated
+ * tools, and the ledger head.
+ */
+export const STATUS_TOOL_DEFINITION = {
+  name: STATUS_TOOL_NAME,
+  description:
+    "Report the spend gate's live status with evidence: version, mode, policy path, " +
+    "downstream servers and tool counts, gated tool names, agent identity, ledger head, " +
+    "and pending approvals. Read-only, never gated, moves no money. Call this to answer " +
+    "\"is your gate live\" with proof instead of inference: this tool only exists when " +
+    "your tool traffic is routed through buzz-axiru.",
+  inputSchema: { type: "object", properties: {} }
+} as const;
+
+/** One downstream server's line in the status payload. */
+export interface StatusDownstream {
+  name: string;
+  up: boolean;
+  tools: number;
+}
+
+/**
+ * The shared status payload shape, built by both server modes so the
+ * two cannot drift. Pubkeys are public material; the full hex is fine.
+ */
+export function gateStatusPayload(parts: {
+  version: string;
+  mode: "gate" | "advisory";
+  policyPath: string;
+  downstream: StatusDownstream[];
+  gatedTools: string[];
+  agentPubkey: string | null;
+  ledgerHead: { seq: number; hash: string };
+  pendingApprovals: number;
+}): Record<string, unknown> {
+  return {
+    tool: STATUS_TOOL_NAME,
+    version: parts.version,
+    mode: parts.mode,
+    policy_path: parts.policyPath,
+    downstream: parts.downstream,
+    gated_tools: { count: parts.gatedTools.length, names: parts.gatedTools },
+    agent_pubkey: parts.agentPubkey,
+    ledger: { records: parts.ledgerHead.seq, head_hash: parts.ledgerHead.hash },
+    pending_approvals: parts.pendingApprovals
+  };
+}
+
 /**
  * Longest single JSON-RPC line accepted from the agent, in UTF-16 code
  * units. The agent is untrusted and speaks over a pipe with no framing
@@ -246,9 +303,15 @@ export class McpServer {
       case "ping":
         return response(id, {});
       case "tools/list":
-        return response(id, { tools: [TOOL_DEFINITION] });
+        return response(id, { tools: [TOOL_DEFINITION, STATUS_TOOL_DEFINITION] });
       case "tools/call": {
         const name = message.params?.name;
+        if (name === STATUS_TOOL_NAME) {
+          return response(id, {
+            content: [{ type: "text", text: JSON.stringify(this.statusPayload(), null, 2) }],
+            isError: false
+          });
+        }
         if (name !== TOOL_NAME) {
           return errorResponse(id, -32602, `Unknown tool: ${String(name)}`);
         }
@@ -289,6 +352,26 @@ export class McpServer {
         if (isNotification) return null;
         return errorResponse(id, -32601, `Method not found: ${message.method}`);
     }
+  }
+
+  /**
+   * Advisory-mode status: no downstream servers exist and nothing is
+   * gated, and saying so plainly is the point. An agent that calls this
+   * and sees mode "advisory" knows encouragement is all that stands
+   * between it and money.
+   */
+  private statusPayload(): Record<string, unknown> {
+    const config = this.bridge.config;
+    return gateStatusPayload({
+      version: this.version,
+      mode: "advisory",
+      policyPath: config.config_path,
+      downstream: [],
+      gatedTools: [],
+      agentPubkey: process.env.BUZZ_AXIRU_AGENT_PUBKEY ?? config.agent_pubkey ?? null,
+      ledgerHead: this.bridge.ledger.head,
+      pendingApprovals: this.bridge.approvals.pending().length
+    });
   }
 
   /** Serve newline-delimited JSON-RPC on stdin/stdout until stdin closes. */

@@ -53,11 +53,14 @@ import { DownstreamPool } from "./pool.js";
 import type { Bridge, SpendRequest } from "./guard.js";
 import {
   errorResponse,
+  gateStatusPayload,
   isJsonObject,
   jsonShapeProblem,
   LATEST_PROTOCOL_VERSION,
   response,
   serveNdjson,
+  STATUS_TOOL_DEFINITION,
+  STATUS_TOOL_NAME,
   SUPPORTED_PROTOCOL_VERSIONS,
   TOOL_DEFINITION,
   TOOL_NAME,
@@ -322,7 +325,11 @@ export class GateServer {
    * already includes the owning server's tool_prefix.
    */
   isGated(toolName: string): boolean {
-    if (toolName === TOOL_NAME) return false;
+    // The gate's own tools are exempt BEFORE the matcher runs: the
+    // status probe must stay callable even under gate-everything
+    // configs, or agents lose the one way to verify the gate exists.
+    // Neither tool can move money.
+    if (toolName === TOOL_NAME || toolName === STATUS_TOOL_NAME) return false;
     return isGatedTool(this.config, toolName);
   }
 
@@ -418,9 +425,12 @@ export class GateServer {
   private mergedTools(): Array<Record<string, unknown>> {
     // The pool already applied hide_tools and tool_prefix, so these are
     // the exposed names and nothing else needs filtering here.
-    const tools: Array<Record<string, unknown>> = [TOOL_DEFINITION as unknown as Record<string, unknown>];
+    const tools: Array<Record<string, unknown>> = [
+      TOOL_DEFINITION as unknown as Record<string, unknown>,
+      STATUS_TOOL_DEFINITION as unknown as Record<string, unknown>
+    ];
     for (const tool of this.downstreamTools) {
-      if (tool.name === TOOL_NAME) continue; // ours wins
+      if (tool.name === TOOL_NAME || tool.name === STATUS_TOOL_NAME) continue; // ours wins
       if (this.isGated(tool.name)) {
         tools.push({ ...tool, description: `${tool.description ?? ""}${GATED_TOOL_NOTICE}` });
       } else {
@@ -448,6 +458,13 @@ export class GateServer {
     const shapeProblem = jsonShapeProblem(args);
     if (shapeProblem !== null) {
       return errorResponse(id, -32602, `tools/call rejected: ${shapeProblem}`);
+    }
+
+    // The status probe: read-only evidence that the gate is live. It
+    // answers before the unknown-tool check because it is the gate's
+    // own tool, not a downstream one.
+    if (name === STATUS_TOOL_NAME) {
+      return response(id, textResult(this.statusPayload(), false));
     }
 
     // The advisory tool keeps working in gate mode.
@@ -479,6 +496,28 @@ export class GateServer {
       return this.passthrough(id, name, args);
     }
     return this.gatedCall(id, name, args);
+  }
+
+  /**
+   * The axiru_gate_status payload for gate mode. Everything here is
+   * observable evidence, not configuration echo: server liveness and
+   * tool counts come from the running pool, the ledger head from the
+   * hash chain on disk, pending approvals from the live store.
+   */
+  private statusPayload(): Record<string, unknown> {
+    const gated = this.downstreamTools
+      .map((tool) => tool.name)
+      .filter((toolName) => this.isGated(toolName));
+    return gateStatusPayload({
+      version: this.version,
+      mode: "gate",
+      policyPath: this.config.config_path,
+      downstream: this.downstream.serverStatus(),
+      gatedTools: gated,
+      agentPubkey: this.agentPubkey,
+      ledgerHead: this.bridge.ledger.head,
+      pendingApprovals: this.bridge.approvals.pending().length
+    });
   }
 
   private async passthrough(

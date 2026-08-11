@@ -87,11 +87,12 @@ test("initialize negotiates a protocol version and announces tools", async () =>
   send({ jsonrpc: "2.0", method: "notifications/initialized" });
 });
 
-test("tools/list exposes exactly request_spend_approval", async () => {
+test("tools/list exposes request_spend_approval and the status probe, nothing else", async () => {
   const reply = await request({ jsonrpc: "2.0", id: 2, method: "tools/list" });
   const tools = (reply.result as { tools: Array<Record<string, unknown>> }).tools;
-  assert.equal(tools.length, 1);
+  assert.equal(tools.length, 2);
   assert.equal(tools[0]!.name, "request_spend_approval");
+  assert.equal(tools[1]!.name, "axiru_gate_status");
   const schema = tools[0]!.inputSchema as { required: string[] };
   assert.deepEqual(
     [...schema.required].sort(),

@@ -7,8 +7,9 @@
  *   buzz-axiru init                  write a starter policies.json here
  *   buzz-axiru quickstart            detect your setup, write policies.json,
  *                                    print wiring steps; --check verifies it
- *   buzz-axiru adopt                 point a Buzz Desktop agent at the gate
- *                                    (edits managed-agents.json; app closed)
+ *   buzz-axiru adopt                 route an agent through the gate: Buzz
+ *                                    Desktop custom harness by default (app
+ *                                    closed), or --harness claude-code|codex
  *   buzz-axiru pending               list approvals waiting on a human
  *   buzz-axiru approve <id>          grant a pending approval
  *   buzz-axiru deny <id>             deny a pending approval
@@ -23,19 +24,33 @@
  * Licensed under the Apache License, Version 2.0.
  */
 
-import { chmodSync, existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 
 import {
+  buildCustomHarness,
+  customHarnessPathFor,
   describeStructure,
   findManagedAgentsFiles,
   locateAgents,
   managedAgentsSearchRoots,
+  mergeCodexToml,
+  mergeMcpJson,
+  planSpaceFreeGatePath,
   refuseIfBuzzDesktopRunning,
+  resolveGateBinary,
+  selectAgentGroup,
   setAgentMcpCommand,
-  writeBackup
+  setAgentRuntime,
+  unsetAgentGate,
+  writeBackup,
+  writeGateShim,
+  BUZZ_ACP_BINARY,
+  CUSTOM_HARNESS_ID,
+  CUSTOM_HARNESS_LABEL,
+  type AgentsCollection
 } from "./adopt.js";
 import { isExpired } from "./approvals.js";
 import {
@@ -47,6 +62,7 @@ import {
 } from "./config.js";
 import { GateServer } from "./gate.js";
 import { Bridge } from "./guard.js";
+import { fileLimitWarning } from "./downstream.js";
 import { verifyLedger } from "./ledger.js";
 import { withDataDirLock } from "./lock.js";
 import { LATEST_PROTOCOL_VERSION, McpServer } from "./mcp.js";
@@ -61,7 +77,7 @@ import {
 } from "./quickstart.js";
 import { STARTER_POLICIES } from "./scaffold.js";
 
-const VERSION = "0.5.1";
+const VERSION = "0.5.2";
 
 interface ParsedArgs {
   command: string;
@@ -78,7 +94,8 @@ const BOOLEAN_FLAGS = new Set([
   "json",
   "ack-unknown-amount",
   "unset",
-  "dry-run"
+  "dry-run",
+  "legacy"
 ]);
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -253,6 +270,12 @@ async function runQuickstartCheck(flags: Record<string, string>): Promise<void> 
     );
     process.exitCode = 1;
   }
+  // Same check `serve` runs at gate startup; doctor is where operators
+  // look when agents fail with EAGAIN, so it belongs here too.
+  const limitWarning = fileLimitWarning();
+  if (limitWarning !== null) {
+    process.stdout.write(`[WARN] ${limitWarning}\n\n`);
+  }
   if (config.downstream === null) {
     process.stdout.write(
       "[PASS] Config loads.\n" +
@@ -344,24 +367,59 @@ async function runQuickstartCheck(flags: Record<string, string>): Promise<void> 
   }
 }
 
-/**
- * `buzz-axiru adopt`: edit Buzz Desktop's managed-agents.json to route
- * an agent's tools through the gate. This exists because the Desktop
- * app gives imported and custom agents an empty mcp_command, offers no
- * UI field to change it, and reserves the BUZZ_ACP_MCP_COMMAND env var;
- * the file is the only remaining wiring point, and it is only safe to
- * edit while the app is closed.
- */
-async function runAdopt(flags: Record<string, string>): Promise<void> {
-  if (flags.force === "true") {
-    process.stderr.write(
-      "buzz-axiru adopt: --force skips the Buzz-Desktop-is-closed check. If the " +
-        "app is open, this edit can be overwritten or corrupt the agent store.\n"
+/** Prompt-or---yes gate shared by every adopt write path. */
+async function confirmAdoptWrite(flags: Record<string, string>): Promise<void> {
+  if (flags.yes === "true") return;
+  // No TTY means nobody can answer the prompt; require --yes so a
+  // script cannot silently rewrite a config file.
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    fail("buzz-axiru adopt: not a terminal; re-run with --yes to apply this change.");
+  }
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const answer = (await rl.question("Apply this change? [y/N] ")).trim().toLowerCase();
+  rl.close();
+  if (answer !== "y" && answer !== "yes") {
+    fail("buzz-axiru adopt: aborted; nothing was written.");
+  }
+}
+
+/** Absolute path to the buzz-axiru binary for wiring into configs. */
+function resolveGatePath(flags: Record<string, string>): { path: string; source: string } {
+  if (flags["gate-path"] !== undefined) {
+    if (!isAbsolute(flags["gate-path"])) {
+      fail("buzz-axiru adopt: --gate-path must be an absolute path");
+    }
+    return { path: flags["gate-path"], source: "--gate-path" };
+  }
+  const resolved = resolveGateBinary();
+  if (resolved === null) {
+    fail(
+      "buzz-axiru adopt: could not locate the buzz-axiru executable. Install it " +
+        "(npm install -g buzz-axiru) or pass --gate-path <absolute-path>."
     );
   }
-  const refusal = refuseIfBuzzDesktopRunning(flags.force === "true");
-  if (refusal !== null) fail(refusal);
+  return resolved;
+}
 
+/** Rewrite a config file in place, preserving its permission bits when
+ *  it already exists (the file is the other tool's, not ours). */
+function writePreservingMode(path: string, content: string): void {
+  if (existsSync(path)) {
+    const mode = statSync(path).mode & 0o777;
+    writeFileSync(path, content, { encoding: "utf8", mode });
+    chmodSync(path, mode);
+  } else {
+    writeFileSync(path, content, { encoding: "utf8" });
+  }
+}
+
+/** Locate, read, and parse managed-agents.json, failing with the
+ *  established messages. Shared by the legacy and harness flows. */
+function loadManagedAgents(flags: Record<string, string>): {
+  path: string;
+  doc: unknown;
+  collection: AgentsCollection;
+} {
   // Locate the file: explicit --data wins; otherwise search the standard
   // Buzz Desktop data directories, refusing to guess between multiple hits.
   let path: string;
@@ -417,7 +475,165 @@ async function runAdopt(flags: Record<string, string>): Promise<void> {
         "(it contains no values from your file)."
     );
   }
+  return { path, doc, collection };
+}
 
+/**
+ * `buzz-axiru adopt`: wire an agent's tool traffic through the gate.
+ *
+ * Default (Buzz Desktop): create/update a CUSTOM HARNESS whose command
+ * is buzz-acp with ["--mcp-command", <gate>] as two argv elements, and
+ * point the agent's runtime at it. Field-verified (0.5.2): editing the
+ * agent record's mcp_command does NOT work under Desktop, because the
+ * app injects BUZZ_ACP_MCP_COMMAND first in the child envp and the
+ * first duplicate wins; the argv flag is the only override that beats
+ * it. --legacy keeps the old mcp_command edit for setups where the
+ * record value is honored. --harness claude-code|codex instead merges
+ * the gate into those tools' MCP config files.
+ */
+async function runAdopt(flags: Record<string, string>): Promise<void> {
+  const harness = flags.harness ?? "buzz";
+  if (harness === "claude-code" || harness === "codex") {
+    await runAdoptFileHarness(harness, flags);
+    return;
+  }
+  if (harness !== "buzz") {
+    fail(`buzz-axiru adopt: unknown --harness "${harness}" (use buzz, claude-code, codex)`);
+  }
+
+  if (flags.force === "true") {
+    process.stderr.write(
+      "buzz-axiru adopt: --force skips the Buzz-Desktop-is-closed check. If the " +
+        "app is open, this edit can be overwritten or corrupt the agent store.\n"
+    );
+  }
+  const refusal = refuseIfBuzzDesktopRunning(flags.force === "true");
+  if (refusal !== null) fail(refusal);
+
+  const { path, doc, collection } = loadManagedAgents(flags);
+
+  if (flags.legacy === "true") {
+    await runAdoptLegacy(flags, path, doc, collection);
+    return;
+  }
+  if (flags.unset === "true") {
+    await runAdoptUnset(flags, path, doc, collection);
+    return;
+  }
+
+  // The harness flow, the one field testing proved works.
+  const gate = resolveGatePath(flags);
+  const plan = planSpaceFreeGatePath(gate.path);
+  if (plan.warning !== null) {
+    process.stderr.write(`buzz-axiru adopt: WARNING: ${plan.warning}\n`);
+  }
+  if (!existsSync(BUZZ_ACP_BINARY)) {
+    process.stderr.write(
+      `buzz-axiru adopt: WARNING: ${BUZZ_ACP_BINARY} does not exist on this machine. ` +
+        "The harness is written anyway, but it cannot launch until Buzz Desktop is " +
+        "installed at the standard location.\n"
+    );
+  }
+
+  let group;
+  let runtimeEdit;
+  try {
+    group = selectAgentGroup(collection, flags.agent ?? null);
+    runtimeEdit = setAgentRuntime(collection, flags.agent ?? null, CUSTOM_HARNESS_ID);
+  } catch (err) {
+    fail(`buzz-axiru adopt: ${(err as Error).message}`);
+  }
+
+  const harnessPath = customHarnessPathFor(path);
+  let existingHarness: unknown = null;
+  const harnessExists = existsSync(harnessPath);
+  if (harnessExists) {
+    try {
+      existingHarness = JSON.parse(readFileSync(harnessPath, "utf8"));
+    } catch (err) {
+      fail(
+        `buzz-axiru adopt: ${harnessPath} is not valid JSON (${(err as Error).message}). ` +
+          "Refusing to touch it; delete or fix it first."
+      );
+    }
+  }
+  const harnessDoc = buildCustomHarness(existingHarness, plan.path);
+
+  process.stdout.write(
+    [
+      `${path}`,
+      `  agents collection: ${collection.location}`,
+      `  agent:             ${group.name}` +
+        (group.rows.length > 1
+          ? ` (stored as ${group.rows.length} rows; live instance preferred)`
+          : ""),
+      `  runtime:           ${JSON.stringify(runtimeEdit.previous)} -> ${JSON.stringify(CUSTOM_HARNESS_ID)}`,
+      `  harness file:      ${harnessPath} (${harnessExists ? "update" : "new"})`,
+      `  harness label:     ${CUSTOM_HARNESS_LABEL}`,
+      `  harness command:   ${BUZZ_ACP_BINARY}`,
+      `  harness args:      ${JSON.stringify(harnessDoc.args)}  (two separate elements)`,
+      `  gate binary:       ${gate.path} (via ${gate.source})`,
+      ...(plan.action === "write-shim"
+        ? [
+            `  shim:              ${plan.shim} will be created/refreshed (the resolved`,
+            "                     path contains spaces, which break harness arg handling)"
+          ]
+        : []),
+      "  note:              files are re-serialized with 2-space indent; timestamped",
+      "                     backups are written first",
+      ""
+    ].join("\n")
+  );
+
+  if (flags["dry-run"] === "true") {
+    process.stdout.write("Dry run: nothing was written.\n");
+    return;
+  }
+  await confirmAdoptWrite(flags);
+
+  if (plan.action === "write-shim") writeGateShim(plan.shim!, gate.path);
+  const backup = writeBackup(path);
+  const harnessBackup = harnessExists ? writeBackup(harnessPath) : null;
+  mkdirSync(join(harnessPath, ".."), { recursive: true });
+  writePreservingMode(harnessPath, JSON.stringify(harnessDoc, null, 2) + "\n");
+  writePreservingMode(path, JSON.stringify(doc, null, 2) + "\n");
+  process.stdout.write(
+    [
+      `Backup:  ${backup}`,
+      ...(harnessBackup !== null ? [`Backup:  ${harnessBackup}`] : []),
+      `Updated: ${path}`,
+      `Harness: ${harnessPath}`,
+      "",
+      "Next steps:",
+      "  1. Reopen Buzz Desktop.",
+      `  2. In the agent's settings, confirm the runtime is "${CUSTOM_HARNESS_LABEL}" and set`,
+      "     the MODEL explicitly: an agent on a custom harness does not inherit a",
+      "     default model, and an unset model fails to launch.",
+      `  3. Restart the agent (${group.name}).`,
+      "  4. Prove the gate is live from the inside: ask the agent to call the",
+      "     axiru_gate_status tool and paste the JSON. Agents cannot see the gate",
+      "     any other way (the wiring is an argv flag, and tool names are",
+      "     unchanged in passthrough).",
+      "  5. And from the outside:  buzz-axiru doctor",
+      ""
+    ].join("\n")
+  );
+}
+
+/** The pre-0.5.2 mcp_command edit, kept behind --legacy. */
+async function runAdoptLegacy(
+  flags: Record<string, string>,
+  path: string,
+  doc: unknown,
+  collection: AgentsCollection
+): Promise<void> {
+  process.stderr.write(
+    "buzz-axiru adopt: --legacy edits the agent record's mcp_command. Field " +
+      "testing proved Buzz Desktop IGNORES that value (the app injects " +
+      "BUZZ_ACP_MCP_COMMAND first in the child envp and the first duplicate " +
+      "wins). Use this mode only for file formats where the record value is " +
+      "honored; otherwise run adopt without --legacy.\n"
+  );
   const next = flags.unset === "true" ? "" : "buzz-axiru";
   let edit;
   try {
@@ -445,26 +661,10 @@ async function runAdopt(flags: Record<string, string>): Promise<void> {
     process.stdout.write("Dry run: nothing was written.\n");
     return;
   }
-  if (flags.yes !== "true") {
-    // No TTY means nobody can answer the prompt; require --yes so a
-    // script cannot silently rewrite Buzz's state file.
-    if (!process.stdin.isTTY || !process.stdout.isTTY) {
-      fail("buzz-axiru adopt: not a terminal; re-run with --yes to apply this change.");
-    }
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
-    const answer = (await rl.question("Apply this change? [y/N] ")).trim().toLowerCase();
-    rl.close();
-    if (answer !== "y" && answer !== "yes") {
-      fail("buzz-axiru adopt: aborted; nothing was written.");
-    }
-  }
+  await confirmAdoptWrite(flags);
 
   const backup = writeBackup(path);
-  // Preserve the file's own permission bits: the store is Buzz's file,
-  // and tightening or loosening its mode is not this command's call.
-  const mode = statSync(path).mode & 0o777;
-  writeFileSync(path, JSON.stringify(doc, null, 2) + "\n", { encoding: "utf8", mode });
-  chmodSync(path, mode);
+  writePreservingMode(path, JSON.stringify(doc, null, 2) + "\n");
   process.stdout.write(
     [
       `Backup:  ${backup}`,
@@ -476,11 +676,116 @@ async function runAdopt(flags: Record<string, string>): Promise<void> {
       ...(flags.unset === "true"
         ? ["  3. The agent's mcp command is empty again; the gate is out of the loop."]
         : [
-            "  3. Prove the gate is live:",
-            "       buzz-axiru quickstart --check",
-            "  4. In the agent's channel, ask:",
-            "       @Axiru confirm your gate is live"
+            "  3. Prove the gate is live: ask the agent to call axiru_gate_status,",
+            "     and run:",
+            "       buzz-axiru doctor"
           ]),
+      ""
+    ].join("\n")
+  );
+}
+
+/** Take the gate back out of the loop (default-mode --unset). */
+async function runAdoptUnset(
+  flags: Record<string, string>,
+  path: string,
+  doc: unknown,
+  collection: AgentsCollection
+): Promise<void> {
+  let edit;
+  try {
+    edit = unsetAgentGate(collection, flags.agent ?? null, CUSTOM_HARNESS_ID);
+  } catch (err) {
+    fail(`buzz-axiru adopt: ${(err as Error).message}`);
+  }
+  if (edit.changes.length === 0) {
+    process.stdout.write(
+      `buzz-axiru adopt: agent ${edit.agentName} does not reference the gate; nothing to do.\n`
+    );
+    return;
+  }
+  process.stdout.write(
+    [
+      `${path}`,
+      `  agent:  ${edit.agentName}`,
+      ...edit.changes.map((change) => `  change: ${change}`),
+      ""
+    ].join("\n")
+  );
+  if (flags["dry-run"] === "true") {
+    process.stdout.write("Dry run: nothing was written.\n");
+    return;
+  }
+  await confirmAdoptWrite(flags);
+  const backup = writeBackup(path);
+  writePreservingMode(path, JSON.stringify(doc, null, 2) + "\n");
+  process.stdout.write(
+    [
+      `Backup:  ${backup}`,
+      `Updated: ${path}`,
+      "",
+      "The agent no longer routes through the gate. The custom harness file, if",
+      "any, is left in place: unreferenced harnesses are inert.",
+      ""
+    ].join("\n")
+  );
+}
+
+/**
+ * `adopt --harness claude-code|codex`: merge the gate into that tool's
+ * MCP config. No Buzz-Desktop-is-closed check: these files belong to
+ * tools that read them at startup, not live-rewriting apps.
+ */
+async function runAdoptFileHarness(
+  harness: "claude-code" | "codex",
+  flags: Record<string, string>
+): Promise<void> {
+  const gate = resolveGatePath(flags);
+  const target =
+    harness === "claude-code" ? resolve(".mcp.json") : join(homedir(), ".codex", "config.toml");
+  const existingRaw = existsSync(target) ? readFileSync(target, "utf8") : null;
+  let merged;
+  try {
+    merged =
+      harness === "claude-code"
+        ? mergeMcpJson(existingRaw, gate.path)
+        : mergeCodexToml(existingRaw, gate.path);
+  } catch (err) {
+    fail(`buzz-axiru adopt: ${(err as Error).message}`);
+  }
+  if (!merged.changed) {
+    process.stdout.write(`buzz-axiru adopt: ${target} already routes through the gate; nothing to do.\n`);
+    return;
+  }
+  process.stdout.write(
+    [
+      `${target} (${existingRaw === null ? "new" : "update"})`,
+      `  server:      ${CUSTOM_HARNESS_ID}`,
+      `  command:     ${gate.path} (via ${gate.source})`,
+      ...(existingRaw !== null ? ["  note:        a timestamped backup is written first"] : []),
+      ""
+    ].join("\n")
+  );
+  if (flags["dry-run"] === "true") {
+    process.stdout.write("Dry run: nothing was written.\n");
+    return;
+  }
+  await confirmAdoptWrite(flags);
+  const backup = existingRaw !== null ? writeBackup(target) : null;
+  mkdirSync(join(target, ".."), { recursive: true });
+  writePreservingMode(target, merged.content);
+  process.stdout.write(
+    [
+      ...(backup !== null ? [`Backup:  ${backup}`] : []),
+      `Updated: ${target}`,
+      "",
+      "Next steps:",
+      harness === "claude-code"
+        ? "  1. Restart Claude Code (or start a new session) in this project."
+        : "  1. Restart Codex.",
+      "  2. Prove the gate is live: ask the agent to call axiru_gate_status,",
+      "     and run:",
+      "       buzz-axiru doctor",
       ""
     ].join("\n")
   );
@@ -508,9 +813,13 @@ async function main(): Promise<void> {
         "                               --agent-pubkey <pubkey>, --force); --check starts the configured downstream",
         "                               servers, reports tool counts, and exits 0/1",
         "  buzz-axiru doctor            run the same security-readiness and connectivity check",
-        "  buzz-axiru adopt             point a Buzz Desktop managed agent at the gate by",
-        "                               editing the app's managed-agents.json (quit Buzz first;",
-        "                               --agent <name>, --data <path>, --unset, --dry-run, --yes)",
+        "  buzz-axiru adopt             route an agent's tools through the gate. Default: create",
+        "                               an \"Axiru Gated\" custom harness for Buzz Desktop and point",
+        "                               the agent's runtime at it (quit Buzz first; --agent <name>,",
+        "                               --data <path>, --gate-path <abs>, --unset, --dry-run, --yes;",
+        "                               --legacy edits mcp_command instead, which Buzz Desktop",
+        "                               is known to ignore). --harness claude-code merges the gate",
+        "                               into ./.mcp.json; --harness codex into ~/.codex/config.toml",
         "  buzz-axiru pending           list approvals waiting on a human",
         "  buzz-axiru show <id>         inspect one approval and its exact parked call",
         "  buzz-axiru approve <id>      grant a pending approval",
@@ -525,7 +834,8 @@ async function main(): Promise<void> {
         "       --outcome executed|failed --note <evidence> (reconcile)",
         "       --harness buzz|goose|claude-code|codex  --yes  --check (quickstart)",
         "       --agent-pubkey <hex-or-npub> (quickstart)",
-        "       --agent <name>  --data <path>  --unset  --dry-run  --yes (adopt)",
+        "       --agent <name>  --data <path>  --unset  --dry-run  --yes  --legacy",
+        "       --harness buzz|claude-code|codex  --gate-path <abs> (adopt)",
         ""
       ].join("\n")
     );
@@ -581,6 +891,15 @@ async function main(): Promise<void> {
       process.stderr.write(
         `buzz-axiru ${VERSION}: MCP server on stdio | mode: ${mode} | policies: ${config.config_path} | data: ${config.data_dir}\n`
       );
+      // Field-verified (0.5.2): a gate spawned under a Buzz custom
+      // harness inherits the login shell's low limits (macOS soft
+      // maxfiles 256), and buzz-acp's parallelism can then fail every
+      // agent with EAGAIN. Warn loudly, never fail: a low limit
+      // degrades throughput, it does not make gating unsafe.
+      const limitWarning = fileLimitWarning();
+      if (limitWarning !== null) {
+        process.stderr.write(`buzz-axiru: WARNING: ${limitWarning}\n`);
+      }
       if (mode === "advisory") {
         await new McpServer(bridge, VERSION).serveStdio();
         return;

@@ -79,37 +79,63 @@ export.
 Buzz Desktop creates imported and custom agents with an empty `mcp_command`
 and no way to change it in the app: the profile panel shows the field
 read-only (and hides it when empty), the edit-agent dialog has no input for
-it, and the reserved-variable list blocks `BUZZ_ACP_MCP_COMMAND`. The one
-working wiring point is the app's own `managed-agents.json`, edited while the
-app is closed. `adopt` does that edit safely:
+it, and the reserved-variable list blocks `BUZZ_ACP_MCP_COMMAND`. Worse,
+field testing proved that hand-editing `mcp_command` in
+`managed-agents.json` does not work either: the app injects
+`BUZZ_ACP_MCP_COMMAND=<bundled server>` first in the agent child's envp,
+appended overrides lose (buzz-acp reads the first duplicate), and a bare
+command name silently falls back to the app bundle's directory. The one
+override that wins is buzz-acp's own `--mcp-command` argv flag, and the one
+place an operator can supply argv is a custom harness. So that is what
+`adopt` writes:
 
 ```bash
 # 1. Quit Buzz Desktop completely (adopt refuses to run while it is open:
 #    the app rewrites managed-agents.json live, and editing under it can
 #    corrupt your agent store).
-# 2. Point the agent at the gate:
+# 2. Wire the agent through the gate:
 buzz-axiru adopt --agent <name>
-# 3. Reopen Buzz, restart the agent, then prove the gate is live:
-buzz-axiru quickstart --check
+# 3. Reopen Buzz, set the agent's model explicitly (custom harnesses do not
+#    inherit a default model), restart the agent, then prove the gate:
+buzz-axiru doctor
 ```
 
-Then ask in the agent's channel: `@Axiru confirm your gate is live`.
+`adopt` creates or refreshes a custom harness file (`custom_harnesses/
+axiru-gate.json`, label "Axiru Gated") whose command is buzz-acp with
+`["--mcp-command", "<absolute path to buzz-axiru>"]` as two separate
+argument elements, and points the agent's `runtime` at it. If the resolved
+buzz-axiru path contains spaces (which break harness argument handling), it
+creates a two-line exec shim at `/usr/local/bin/buzz-axiru` when that
+directory is writable, and prints instructions when it is not. Pass
+`--gate-path <absolute>` to pin the binary location yourself.
 
-`adopt` finds `managed-agents.json` in the standard Buzz Desktop locations
-(macOS: `~/Library/Application Support/Buzz*/` and `~/.buzz*/`; Linux:
-`~/.config/buzz*/` and `~/.buzz*/`). If it finds several it lists them and
-asks you to pick one with `--data <path>`; if it finds none, ask a
-shell-capable Buzz agent where the file lives and pass `--data` yourself.
-Before writing anything it makes a timestamped backup next to the file,
-shows you the exact field change, and waits for confirmation (`--yes` for
-scripts, `--dry-run` to only look). `--unset` restores the empty
-`mcp_command` and takes the gate back out of the loop. Both field spellings
-(`mcp_command` and `mcpCommand`) are handled; whichever the file uses is the
-one edited. Note the file is re-serialized with 2-space indentation, so
-formatting may normalize; the backup keeps the original bytes.
+It finds `managed-agents.json` in the standard Buzz Desktop locations
+(macOS: `~/Library/Application Support/{Buzz*,xyz.block.buzz.app}/` and
+`~/.buzz*/`, including an `agents/` subdirectory; Linux: `~/.config/buzz*/`
+and `~/.buzz*/`). If it finds several it lists them and asks you to pick one
+with `--data <path>`; if it finds none, ask a shell-capable Buzz agent where
+the file lives and pass `--data` yourself. The file stores each agent twice
+(a persona definition row and a live instance row); adopt treats them as one
+agent and prefers the live row. Before writing anything it makes timestamped
+backups, shows you the exact changes, and waits for confirmation (`--yes`
+for scripts, `--dry-run` to only look). `--unset` clears the gate wiring
+again. `--legacy` keeps the old `mcp_command` edit, with a warning, for
+setups where that field is honored.
+
+To verify from the inside, ask the agent to call its `axiru_gate_status`
+tool and paste the JSON. The tool only exists when traffic routes through
+the gate, so it is evidence, not inference: agents cannot otherwise tell (the
+wiring is an argv flag, and tool names are unchanged in passthrough).
+
+Other harnesses can adopt the gate too: `buzz-axiru adopt --harness
+claude-code` merges an `axiru-gate` server into `.mcp.json` in the current
+project, and `--harness codex` merges `[mcp_servers.axiru-gate]` into
+`~/.codex/config.toml`. Both are idempotent, backed up, and honor
+`--dry-run`/`--yes`.
 
 There is a ready-to-file upstream issue asking Buzz Desktop to expose the
-field in its UI: [GITHUB-ISSUE-BUZZ.md](GITHUB-ISSUE-BUZZ.md).
+field in its UI and fix the silent fallback:
+[GITHUB-ISSUE-BUZZ.md](GITHUB-ISSUE-BUZZ.md).
 
 `doctor` (also available as `quickstart --check`) loads the config, starts
 every configured downstream server exactly the way `serve` does, lists its
@@ -241,6 +267,13 @@ are ready to route your payment server through the gate.
 Amounts are strings in minor units (cents for USD) because JavaScript numbers
 lose precision exactly where large transfers live. The tool stays available in
 gate mode too, so agents can check policy before committing to a plan.
+
+Both modes also expose `axiru_gate_status`: a read-only, never-gated probe
+that returns the gate's version, mode, policy path, downstream servers with
+tool counts, gated tool names, agent pubkey, ledger record count and head
+hash, and the pending approvals count. It exists so an agent asked "is your
+gate live" can answer with evidence; in advisory mode it reports
+`"mode": "advisory"` so nobody mistakes encouragement for enforcement.
 
 ## How gating works
 

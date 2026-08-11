@@ -68,6 +68,21 @@ export class DownstreamPool {
     return this.members.map((m) => m.config);
   }
 
+  /**
+   * Per-server liveness and exposed tool counts, for the status tool.
+   * Computed from the owner map so the count matches what the agent can
+   * actually call (hide_tools excluded, prefixes applied).
+   */
+  serverStatus(): Array<{ name: string; up: boolean; tools: number }> {
+    return this.members.map((member) => {
+      let tools = 0;
+      for (const owner of this.owners.values()) {
+        if (owner.member === member) tools += 1;
+      }
+      return { name: member.config.name, up: member.client.alive, tools };
+    });
+  }
+
   get alive(): boolean {
     return this.members.every((m) => m.client.alive);
   }

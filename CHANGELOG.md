@@ -1,5 +1,74 @@
 # Changelog
 
+## 0.5.2
+
+The field-test release: every fix in it comes from an overnight of real
+Buzz agents running the gate on a real machine. Credit for the reports,
+the reproductions, and the tracing goes to the Buzz agents who did that
+field testing.
+
+- Fixed: downstream commands given as a bare name ("buzz-dev-mcp",
+  "npx") failed to start with `spawn <name> ENOENT` on any config that
+  predates the explicit env allowlist. Since 0.4.0 `env_passthrough`
+  defaults to "none", so the child environment has no PATH, and Node
+  resolves a spawned executable against the child's PATH rather than
+  the gate's. The gate now resolves bare command names against its own
+  (parent) PATH before spawning and passes the child environment
+  through unchanged, so "none" still forwards no parent variables,
+  PATH included. Commands containing a path separator are untouched.
+  This restores the pre-0.4 resolution behaviour without weakening the
+  secret isolation that 0.4.0 introduced.
+- Improved: when a bare command cannot be found on the gate's PATH
+  either, startup still fails closed but now says which command was
+  not found and suggests using an absolute path in policies.json,
+  instead of surfacing a raw ENOENT.
+- Fixed: `adopt` for Buzz Desktop now creates an "Axiru Gated" custom
+  harness (buzz-acp with `["--mcp-command", "<gate>"]` as two separate
+  argv elements) and points the agent's runtime at it, instead of
+  editing `mcp_command`. Field testing proved the old edit does
+  nothing: Desktop injects `BUZZ_ACP_MCP_COMMAND` first in the child
+  envp, appended overrides lose (first duplicate wins in buzz-acp),
+  and only the argv flag beats the env var. The old mode survives
+  behind `--legacy`, with a warning. adopt also prints the new
+  required step: an agent on a custom harness must have its model set
+  explicitly.
+- Fixed: `adopt` no longer double-counts agents. managed-agents.json
+  stores each agent twice (a persona definition row and a live
+  instance row); adopt now dedupes by identity, prefers the live row
+  (the one with a pubkey or runtime metadata), and reports each agent
+  once, so one agent no longer trips "2 agents share the name".
+- Fixed: `adopt` now searches the real macOS Buzz Desktop data dir,
+  `~/Library/Application Support/xyz.block.buzz.app/`, including the
+  `agents/` subdirectory where managed-agents.json actually lives.
+- Added: when the resolved buzz-axiru path contains spaces (which
+  break harness argument handling), adopt creates a two-line exec shim
+  at /usr/local/bin/buzz-axiru when writable, and prints copy-paste
+  instructions when not. `--gate-path` pins the binary explicitly.
+- Added: `axiru_gate_status`, a read-only MCP tool in both gate and
+  advisory modes, never gated regardless of payment_tools patterns. It
+  returns version, mode, policy path, downstream servers with tool
+  counts, gated tool names, agent pubkey, ledger record count and head
+  hash, and pending approvals. Field testing showed agents cannot
+  otherwise tell whether the gate is live (the wiring is an argv flag
+  and tool names are unchanged), and they misreported when asked; this
+  tool is the evidence they can quote.
+- Added: a low file-descriptor warning at gate startup and in
+  `doctor`. A gate spawned under a Buzz custom harness inherits the
+  login shell's limits (macOS soft maxfiles 256), and buzz-acp running
+  agents in parallel can then fail them all with EAGAIN (os error 35).
+  The warning names the `launchctl limit maxfiles` fix and never
+  blocks startup.
+- Added: `adopt --harness claude-code` merges an `axiru-gate` server
+  into the project's `.mcp.json`, and `adopt --harness codex` merges
+  `[mcp_servers.axiru-gate]` into `~/.codex/config.toml`. Both are
+  idempotent, backed up, honor `--dry-run`/`--yes`, and refuse files
+  they cannot parse.
+- Docs: GITHUB-ISSUE-BUZZ.md rewritten with the complete evidence
+  chain and concrete asks (expose mcpCommand in the UI, honor the
+  agent-record value, error instead of silent bundle fallback);
+  README and onboarding notes updated for the custom-harness flow and
+  the axiru_gate_status verification line.
+
 ## 0.5.1
 
 Onboarding release: `buzz-axiru adopt`, the missing wiring step for Buzz

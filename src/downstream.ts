@@ -23,7 +23,9 @@
  * Licensed under the Apache License, Version 2.0.
  */
 
-import { spawn, type ChildProcessByStdio } from "node:child_process";
+import { spawn, spawnSync, type ChildProcessByStdio } from "node:child_process";
+import { accessSync, constants, statSync } from "node:fs";
+import { delimiter, join } from "node:path";
 import type { Readable, Writable } from "node:stream";
 
 type Child = ChildProcessByStdio<Writable, Readable, null>;
@@ -89,6 +91,105 @@ export function childEnv(spec: DownstreamSpawnSpec): NodeJS.ProcessEnv {
   return { ...base, ...spec.env };
 }
 
+/**
+ * Resolve a bare command name against the PARENT process PATH.
+ *
+ * Why this exists: Node resolves a spawned executable against the
+ * CHILD environment's PATH (options.env.PATH), not the parent's. Since
+ * env_passthrough started defaulting to "none" in 0.4.0 the child gets
+ * no PATH at all, so a pre-0.4 config that names its downstream server
+ * by bare name ("buzz-dev-mcp", "npx") failed on upgrade with
+ * `spawn <name> ENOENT` even though the command was plainly on the
+ * operator's PATH. Resolving here, in the parent, restores 0.2.0's
+ * resolution behaviour while keeping the secret hiding intact: the
+ * configured child env is spawned unchanged, so "none" still forwards
+ * nothing from the parent, PATH included.
+ *
+ * A command containing a path separator is returned untouched: the
+ * operator already said exactly where the binary lives.
+ */
+export function resolveCommand(
+  command: string,
+  env: NodeJS.ProcessEnv = process.env
+): string {
+  if (command.includes("/") || command.includes("\\")) return command;
+  for (const dir of (env.PATH ?? "").split(delimiter)) {
+    if (dir.length === 0) continue;
+    const candidate = join(dir, command);
+    if (isExecutableFile(candidate)) return candidate;
+  }
+  // Fail closed, as before the fix, but say what actually went wrong
+  // instead of surfacing a bare ENOENT from deep inside spawn.
+  throw new DownstreamError(
+    `downstream command "${command}" was not found on the gate's PATH. ` +
+      "Set downstream.command to an absolute path in policies.json, or start " +
+      "buzz-axiru with the command's directory on PATH."
+  );
+}
+
+export function isExecutableFile(path: string): boolean {
+  try {
+    if (!statSync(path).isFile()) return false;
+    accessSync(path, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/* -------------------------------------------------------------------- *
+ * Process resource limits guard
+ * -------------------------------------------------------------------- */
+
+/**
+ * Below this soft open-files limit, buzz-acp with its default agent
+ * parallelism can exhaust descriptors and fail every agent with EAGAIN
+ * (os error 35 on macOS). Field-verified: a gate spawned under a Buzz
+ * custom harness inherits the LOGIN shell's limits, and macOS ships a
+ * soft maxfiles of 256 there.
+ */
+export const MIN_RECOMMENDED_MAXFILES = 4096;
+
+function defaultUlimitProbe(): string | null {
+  // Node has no getrlimit binding, so ask a shell. `ulimit` is a shell
+  // builtin (POSIX), not a binary, hence sh -c rather than a direct spawn.
+  const result = spawnSync("sh", ["-c", "ulimit -n"], { encoding: "utf8", timeout: 5_000 });
+  if (result.error !== undefined || result.status !== 0 || typeof result.stdout !== "string") {
+    return null;
+  }
+  return result.stdout.trim();
+}
+
+/**
+ * The soft open-files limit this process runs under, or null when it
+ * cannot be determined or is unlimited (both mean: nothing to warn
+ * about, so the caller stays quiet rather than guessing).
+ */
+export function softMaxFiles(probe: () => string | null = defaultUlimitProbe): number | null {
+  const raw = probe();
+  if (raw === null || raw === "unlimited") return null;
+  const value = Number.parseInt(raw, 10);
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+/**
+ * A warning string when the limit is dangerously low, else null. Never
+ * a failure: a low limit degrades a busy session, it does not make the
+ * gate unsafe, so startup proceeds and the operator gets told how to
+ * raise it.
+ */
+export function fileLimitWarning(soft: number | null = softMaxFiles()): string | null {
+  if (soft === null || soft >= MIN_RECOMMENDED_MAXFILES) return null;
+  return (
+    `this process runs with a soft open-files limit of ${soft} (recommended: at least ` +
+    `${MIN_RECOMMENDED_MAXFILES}). Under Buzz Desktop a custom harness inherits the login ` +
+    "shell's limits, and buzz-acp running several agents in parallel can exhaust file " +
+    "descriptors and fail every agent with EAGAIN (os error 35). On macOS raise the " +
+    "system limit with `sudo launchctl limit maxfiles 65536 200000` and log out and back " +
+    "in, or add `ulimit -n 4096` to your shell profile. The gate itself keeps running."
+  );
+}
+
 export class DownstreamClient {
   private child: Child | null = null;
   private nextId = 1;
@@ -116,7 +217,9 @@ export class DownstreamClient {
     clientVersion: string,
     supportedProtocolVersions: readonly string[] = [protocolVersion]
   ): Promise<void> {
-    this.child = spawn(this.spec.command, this.spec.args, {
+    // Resolved against the PARENT PATH on purpose; see resolveCommand.
+    // The child env stays exactly what the operator configured.
+    this.child = spawn(resolveCommand(this.spec.command), this.spec.args, {
       env: childEnv(this.spec),
       // stderr is inherited so the operator sees downstream logs.
       stdio: ["pipe", "pipe", "inherit"]
