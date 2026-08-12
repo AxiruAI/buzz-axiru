@@ -246,6 +246,50 @@ identical arguments after a human decides. Before planning a large spend,
 you can call request_spend_approval to learn the policy decision in advance.
 ```
 
+## Secure Stripe MCP
+
+Never give an AI agent direct access to Stripe. Give it Axiru.
+
+An agent holding a raw Stripe secret key can refund, invoice, discount, and
+concede disputes at machine speed. The secure-stripe preset puts Stripe's
+official MCP server behind the gate instead, in one command:
+
+```bash
+npm install -g buzz-axiru
+export BUZZ_AXIRU_AGENT_PUBKEY=<agent's-64-char-hex-pubkey-or-npub>
+export STRIPE_SECRET_KEY=<your-key>        # start with a TEST-MODE key
+buzz-axiru quickstart --preset secure-stripe
+buzz-axiru quickstart --check              # spawns the pinned server, exits 0/1
+```
+
+The generated `policies.json` pins `@stripe/mcp@0.2.5` (the newest version
+verified to run the full local toolset under the gate; 0.3.x is a hosted
+proxy whose tool scoping moves to Stripe restricted keys) and exposes every
+Stripe tool to the agent under the `pay_` prefix. What is gated:
+
+- `pay_create_refund` is fully mapped: the amount is policy-checked in minor
+  units, and the refunded PaymentIntent is the counterparty, so the
+  deny-by-default allowlist decides which payments the agent may refund
+  without a human. A full refund omits the amount and fails closed to a
+  human.
+- Payment links, invoices, coupons, subscription changes, and dispute
+  updates are gated without an amount mapping, so every call parks for
+  human approval.
+- Read-only tools (`pay_list_*`, `pay_retrieve_balance`,
+  `pay_search_stripe_documentation`) and catalog writes pass through.
+
+Starter controls: USD 5,000.00 per-agent daily cap, USD 500.00
+single-payment ceiling routed to a human, refund counterparty allowlist
+(deny by default), and business-hours require_approval. Without
+`STRIPE_SECRET_KEY` the Stripe server cannot start and the gate refuses to
+run degraded: no key, no tools, no spend.
+
+Honest scope: run test-mode keys until the approval flow is proven. The gate
+governs what flows through it; a key an agent obtained some other way is out
+of its reach. Stripe-side [restricted keys](https://docs.stripe.com/keys#limit-access)
+are complementary defense in depth, and stacking both is the recommended
+setup.
+
 ## Advisory mode: the on-ramp
 
 Without a `downstream` block (or with `--mode advisory`), the bridge is the

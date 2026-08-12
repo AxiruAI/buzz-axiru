@@ -18,7 +18,8 @@
  *
  * Flags: --mode gate|advisory  --policies <path>  --data-dir <path>
  *        --by <name>  --note <text>  --force (init, quickstart)
- *        --harness buzz|goose|claude-code|codex  --yes  --check (quickstart)
+ *        --harness buzz|goose|claude-code|codex  --preset secure-stripe
+ *        --yes  --check (quickstart)
  * Env:   BUZZ_AXIRU_POLICIES, BUZZ_AXIRU_DATA_DIR, BUZZ_AXIRU_AGENT_PUBKEY
  *
  * Licensed under the Apache License, Version 2.0.
@@ -70,14 +71,17 @@ import { formatAmount, notifyApprovalDecided } from "./notify.js";
 import { DownstreamPool } from "./pool.js";
 import {
   buildQuickstartPolicies,
+  buildSecureStripePolicies,
   detectBuzzDevMcp,
   harnessNextSteps,
   writeQuickstartPolicies,
-  HARNESSES
+  HARNESSES,
+  PRESETS,
+  STRIPE_MCP_VERSION
 } from "./quickstart.js";
 import { STARTER_POLICIES } from "./scaffold.js";
 
-const VERSION = "0.5.2";
+const VERSION = "0.5.3";
 
 interface ParsedArgs {
   command: string;
@@ -177,6 +181,12 @@ function runQuickstart(flags: Record<string, string>): void {
       `buzz-axiru quickstart: unknown --harness "${harness}" (use ${HARNESSES.join(", ")})`
     );
   }
+  const preset = flags.preset ?? null;
+  if (preset !== null && !(PRESETS as readonly string[]).includes(preset)) {
+    fail(
+      `buzz-axiru quickstart: unknown --preset "${preset}" (use ${PRESETS.join(", ")})`
+    );
+  }
   const detected = detectBuzzDevMcp();
   const agentPubkey = flags["agent-pubkey"] ?? process.env.BUZZ_AXIRU_AGENT_PUBKEY ?? null;
   if (agentPubkey !== null && !isPlausiblePubkey(agentPubkey)) {
@@ -184,11 +194,15 @@ function runQuickstart(flags: Record<string, string>): void {
       "buzz-axiru quickstart: --agent-pubkey must be a 64-character lowercase hex Nostr pubkey or npub"
     );
   }
+  const path = resolve(flags.path ?? "policies.json");
+  if (preset === "secure-stripe") {
+    runQuickstartSecureStripe(flags, harness, agentPubkey, path);
+    return;
+  }
   // The shell entry is Buzz's bundled server. Other harnesses bring
   // their own tools, so their config starts in advisory mode with the
   // payment slot ready to move into the downstream array.
   const shell = harness === "buzz" ? detected : null;
-  const path = resolve(flags.path ?? "policies.json");
   try {
     writeQuickstartPolicies(
       path,
@@ -238,6 +252,55 @@ function runQuickstart(flags: Record<string, string>): void {
     harnessNextSteps(harness),
     ""
   );
+  process.stdout.write(lines.join("\n"));
+}
+
+/**
+ * `buzz-axiru quickstart --preset secure-stripe`: never give an AI
+ * agent direct access to Stripe; give it Axiru. Writes a config whose
+ * one downstream server is Stripe's official MCP server, pinned and
+ * prefixed, with every money-moving tool behind the gate.
+ */
+function runQuickstartSecureStripe(
+  flags: Record<string, string>,
+  harness: string,
+  agentPubkey: string | null,
+  path: string
+): void {
+  try {
+    writeQuickstartPolicies(path, buildSecureStripePolicies(agentPubkey), flags.force === "true");
+  } catch (err) {
+    fail(`buzz-axiru quickstart: ${(err as Error).message}`);
+  }
+  const lines: string[] = [
+    `buzz-axiru ${VERSION} quickstart`,
+    "",
+    "preset: secure-stripe (govern Stripe's official MCP server)",
+    `harness: ${harness}`,
+    "",
+    `Wrote ${path}`,
+    agentPubkey === null
+      ? "  agent identity: MISSING - set agent_pubkey or BUZZ_AXIRU_AGENT_PUBKEY before gate mode"
+      : `  agent identity: ${agentPubkey}`,
+    `  downstream:    stripe (npx -y @stripe/mcp@${STRIPE_MCP_VERSION} --tools=all),`,
+    "                 tools exposed to the agent as pay_<tool>",
+    "  gated tools:   refunds, payment links, invoices, coupons, subscription",
+    "                 changes, dispute updates. Read-only tools (pay_list_*,",
+    "                 pay_retrieve_balance) pass through. A gated tool without an",
+    "                 amount mapping always parks for human approval.",
+    "  controls:      USD 5,000.00 per-agent daily cap, USD 500.00 single-payment",
+    "                 ceiling routes to a human, refund counterparty allowlist",
+    "                 (deny by default), business hours 09:00-17:00",
+    "                 America/New_York",
+    "  key:           export STRIPE_SECRET_KEY (a TEST-MODE sk_test_ key first).",
+    "                 Without it the Stripe server cannot start and the gate",
+    "                 fails closed: no key, no tools, no spend.",
+    "",
+    harnessNextSteps(harness),
+    "",
+    "Then prove the whole chain: buzz-axiru quickstart --check",
+    ""
+  ];
   process.stdout.write(lines.join("\n"));
 }
 
@@ -810,7 +873,9 @@ async function main(): Promise<void> {
         "  buzz-axiru init              write a starter policies.json in the current directory",
         "  buzz-axiru quickstart        detect your setup, write policies.json, print wiring",
         "                               steps (--harness buzz|goose|claude-code|codex, --yes,",
-        "                               --agent-pubkey <pubkey>, --force); --check starts the configured downstream",
+        "                               --agent-pubkey <pubkey>, --force); --preset secure-stripe",
+        "                               writes a config that gates Stripe's official MCP server;",
+        "                               --check starts the configured downstream",
         "                               servers, reports tool counts, and exits 0/1",
         "  buzz-axiru doctor            run the same security-readiness and connectivity check",
         "  buzz-axiru adopt             route an agent's tools through the gate. Default: create",
@@ -833,7 +898,7 @@ async function main(): Promise<void> {
         "       --json (pending)  --ack-unknown-amount (approve)",
         "       --outcome executed|failed --note <evidence> (reconcile)",
         "       --harness buzz|goose|claude-code|codex  --yes  --check (quickstart)",
-        "       --agent-pubkey <hex-or-npub> (quickstart)",
+        "       --preset secure-stripe  --agent-pubkey <hex-or-npub> (quickstart)",
         "       --agent <name>  --data <path>  --unset  --dry-run  --yes  --legacy",
         "       --harness buzz|claude-code|codex  --gate-path <abs> (adopt)",
         ""

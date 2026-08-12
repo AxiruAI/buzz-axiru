@@ -25,6 +25,18 @@ import { STARTER_POLICIES } from "./scaffold.js";
 export const HARNESSES = ["buzz", "goose", "claude-code", "codex"] as const;
 export type Harness = (typeof HARNESSES)[number];
 
+export const PRESETS = ["secure-stripe"] as const;
+export type Preset = (typeof PRESETS)[number];
+
+/**
+ * The exact @stripe/mcp version the secure-stripe preset pins.
+ * Field-verified to run the full local toolset (--tools=all) under the
+ * gate. Newer 0.3.x releases are a thin proxy to Stripe's hosted MCP
+ * endpoint (mcp.stripe.com), where tool scoping moves to restricted
+ * API keys instead of a local --tools flag; re-verify before bumping.
+ */
+export const STRIPE_MCP_VERSION = "0.2.5";
+
 export interface DetectedShell {
   /** The command to write into the downstream config. */
   command: string;
@@ -135,6 +147,143 @@ export function buildQuickstartPolicies(
       hide_tools: []
     },
     payment_tools: starter["$payment_tools_example"],
+    approval_ttl_seconds: starter["approval_ttl_seconds"],
+    $approval_ttl_comment: starter["$approval_ttl_comment"],
+    max_pending_approvals: starter["max_pending_approvals"],
+    $max_pending_comment: starter["$max_pending_comment"],
+    agent_pubkey: agentPubkey,
+    $agent_pubkey_comment: starter["$agent_pubkey_comment"],
+    buzz: starter["buzz"],
+    webhook_url: null,
+    data_dir: "data"
+  };
+  return JSON.stringify(doc, null, 2) + "\n";
+}
+
+/**
+ * Build the secure-stripe preset policies.json as a string: the
+ * productized form of "never give an AI agent direct access to Stripe;
+ * give it Axiru". One downstream entry, Stripe's official MCP server,
+ * pinned to the exact version verified with this preset, every tool
+ * exposed under the pay_ prefix, and a starter policy pack sized for a
+ * team's first test-mode deployment rather than the init scaffold's
+ * enterprise placeholders.
+ *
+ * Every gated tool name below is grounded in the @stripe/mcp@0.2.5
+ * toolset (served via @stripe/agent-toolkit) and verified against a
+ * live `--tools=all` catalog under the gate: 22 tools exposed, 9 of
+ * them gated by this list (the toolkit source also registers
+ * send_invoice, but 0.2.5 does not expose it). create_refund is the
+ * only tool in that set that carries an integer minor-units amount
+ * argument, so it is the only tool with an amount mapping. Every other
+ * gated tool has no mapping on purpose and therefore ALWAYS parks for
+ * human approval (the gate fails closed on an unextractable amount).
+ */
+export function buildSecureStripePolicies(agentPubkey: string | null = null): string {
+  const starter = JSON.parse(STARTER_POLICIES) as Record<string, unknown>;
+  const doc: Record<string, unknown> = {
+    $comment:
+      "buzz-axiru config written by `buzz-axiru quickstart --preset secure-stripe`: " +
+      "Stripe's official MCP server behind the Axiru gate. Amounts are integer strings " +
+      "in minor units (cents for USD). Keys starting with $ are ignored by the loader. " +
+      "Start with a TEST-MODE Stripe key. Edit and restart the gate.",
+    rail: "stripe",
+    currency: "USD",
+    controls: {
+      $comment:
+        "Deterministic spend policy, evaluated locally on every decision. Sized for a " +
+        "first test-mode deployment; raise the numbers once the approval flow is proven.",
+      per_agent_daily_cap: {
+        $comment:
+          "Denies an agent's spend once its trailing-24h authorized total reaches the cap. " +
+          "USD 5,000.00.",
+        cap_minor_units: "500000"
+      },
+      single_payment_ceiling: {
+        $comment: "Routes any single payment at or above the threshold to a human. USD 500.00.",
+        threshold_minor_units: "50000",
+        approver_group: "operators"
+      },
+      counterparty_allowlist: {
+        $comment:
+          "Deny by default: anything not in this list is denied outright. pay_create_refund " +
+          "reports the refunded PaymentIntent (pi_...) as its counterparty, so this list is " +
+          "which payments the agent may refund without a human (find ids with " +
+          "pay_list_payment_intents). Replace the placeholder; it matches nothing real. " +
+          "Gated tools with no counterparty mapping never reach this control: they park for " +
+          "human approval first.",
+        allowed_ids: ["pi_3ReplaceWithRealPaymentIntent"]
+      },
+      business_hours: {
+        $comment:
+          "Outside 09:00-17:00 in this timezone, spend is routed to a human instead of allowed.",
+        tz: "America/New_York",
+        open_hour: 9,
+        close_hour: 17,
+        effect: "require_approval"
+      }
+    },
+    downstream: [
+      {
+        $comment:
+          `Stripe's official MCP server, pinned to @stripe/mcp@${STRIPE_MCP_VERSION}, the ` +
+          "version field-verified to run the full local toolset under the gate. Newer " +
+          "0.3.x releases are a hosted proxy to mcp.stripe.com whose tool scoping moves " +
+          "to Stripe restricted API keys; re-verify before bumping the pin. --tools=all " +
+          "is safe here because the gate fronts every exposed tool. Export " +
+          "STRIPE_SECRET_KEY (a TEST-MODE secret key first) in the gate's environment; " +
+          "never write the key into this file. Only the four listed variables reach the " +
+          "child process; if your machine reaches npm through an egress proxy, add your " +
+          "proxy variables (HTTPS_PROXY etc.) to env_passthrough or npx cannot fetch. " +
+          "The timeout is generous because the first start downloads the pinned package; " +
+          "later starts hit the npm cache.",
+        name: "stripe",
+        command: "npx",
+        args: ["-y", `@stripe/mcp@${STRIPE_MCP_VERSION}`, "--tools=all"],
+        env: {},
+        env_passthrough: ["PATH", "HOME", "TMPDIR", "STRIPE_SECRET_KEY"],
+        tool_prefix: "pay_",
+        request_timeout_ms: 120000,
+        hide_tools: []
+      }
+    ],
+    payment_tools: {
+      $comment:
+        `Grounded in the @stripe/mcp@${STRIPE_MCP_VERSION} --tools=all toolset. Gated: the ` +
+        "tools that move money or commit charges (refunds, payment links, invoices, " +
+        "coupons, subscription changes, dispute updates). Passing through: read-only " +
+        "tools (pay_list_*, pay_retrieve_balance, pay_search_stripe_documentation) and " +
+        "catalog writes (pay_create_customer, pay_create_product, pay_create_price). A " +
+        "gated tool WITHOUT an amount mapping always parks for human approval: the gate " +
+        "fails closed when it cannot read an amount. To gate more tools, add their " +
+        "exposed pay_-prefixed names to gate; add a mapping only for a tool whose " +
+        "arguments really carry an integer minor-units amount.",
+      gate: [
+        "pay_create_refund",
+        "pay_create_payment_link",
+        "pay_create_invoice",
+        "pay_create_invoice_item",
+        "pay_finalize_invoice",
+        "pay_create_coupon",
+        "pay_update_subscription",
+        "pay_cancel_subscription",
+        "pay_update_dispute"
+      ],
+      mappings: {
+        pay_create_refund: {
+          $comment:
+            "create_refund takes payment_intent (required) and amount in cents " +
+            "(optional). A FULL refund omits amount and fails closed to a human. The " +
+            "refunded PaymentIntent is the counterparty, so the allowlist above decides " +
+            "which payments may be refunded autonomously. Refunds settle in the original " +
+            "charge's currency; this static USD matches the preset's USD policy pack, " +
+            "change both together.",
+          amount_field: "amount",
+          currency: "USD",
+          counterparty_field: "payment_intent"
+        }
+      }
+    },
     approval_ttl_seconds: starter["approval_ttl_seconds"],
     $approval_ttl_comment: starter["$approval_ttl_comment"],
     max_pending_approvals: starter["max_pending_approvals"],

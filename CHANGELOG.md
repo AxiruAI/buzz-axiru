@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.5.3
+
+Never give an AI agent direct access to Stripe. Give it Axiru.
+
+- Added: `buzz-axiru quickstart --preset secure-stripe` writes a
+  policies.json specialized for governing Stripe's official MCP server.
+  The downstream entry pins `@stripe/mcp@0.2.5` (the newest version
+  verified to run the full local toolset under the gate; 0.3.x is a
+  hosted proxy whose tool scoping moves to Stripe restricted keys),
+  forwards only PATH, HOME, TMPDIR, and STRIPE_SECRET_KEY to the child,
+  and exposes every Stripe tool under the `pay_` prefix. Gate coverage
+  and the refund mapping are grounded in the real 0.2.5 toolset:
+  `pay_create_refund` is amount-mapped and reports the refunded
+  PaymentIntent as its counterparty (so the deny-by-default allowlist
+  decides which payments may be refunded autonomously; a full refund
+  omits the amount and fails closed to a human), while payment links,
+  invoices, coupons, subscription changes, and dispute updates are
+  gated unmapped and always park for human approval. Read-only tools
+  pass through. Starter controls: USD 5,000.00 per-agent daily cap,
+  USD 500.00 single-payment ceiling to a human, refund counterparty
+  allowlist, business-hours require_approval.
+- `quickstart --check` works with the preset unchanged: without
+  STRIPE_SECRET_KEY the pinned server never completes the MCP
+  handshake and the gate fails closed with the existing
+  refusing-to-run-degraded error. Verified against the live 0.2.5
+  catalog under the gate: 22 tools exposed, 9 gated (0.2.5 does not
+  expose send_invoice even though the toolkit source registers it).
+  The preset's downstream timeout is 120s because the first npx start
+  downloads the pinned package; operators behind an egress proxy must
+  add their proxy variables to env_passthrough.
+- README: new "Secure Stripe MCP" section with the one-command setup
+  and the honest scope note (test-mode keys first; the gate governs
+  what flows through it; Stripe restricted keys are complementary
+  defense in depth).
+
 ## 0.5.2
 
 The field-test release: every fix in it comes from an overnight of real
